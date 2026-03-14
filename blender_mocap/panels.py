@@ -56,6 +56,7 @@ class MOCAP_PT_capture(Panel):
             row.operator("mocap.stop_preview", icon="SNAP_FACE")
 
         layout.label(text=f"Status: {props.status}")
+        layout.operator("mocap.reset_pose", icon="LOOP_BACK")
 
 
 class MOCAP_PT_recordings(Panel):

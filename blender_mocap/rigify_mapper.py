@@ -93,13 +93,13 @@ RIGIFY_BONE_MAP = {
     "foot_fk.R":      {"indices": [30, 32], "type": "foot"},
 }
 
-# Bones that need IK/FK switch set to FK (1.0)
-# The IK_FK property lives on the IK control bones
+# Bones that carry the IK_FK custom property (the limb parent/master bones)
+# Setting IK_FK = 1.0 switches to FK mode, 0.0 = IK mode
 IK_FK_SWITCH_BONES = [
-    "hand_ik.L",
-    "hand_ik.R",
-    "foot_ik.L",
-    "foot_ik.R",
+    "upper_arm_parent.L",
+    "upper_arm_parent.R",
+    "thigh_parent.L",
+    "thigh_parent.R",
 ]
 
 # Spine/head use composite calculations with Rigify generated names

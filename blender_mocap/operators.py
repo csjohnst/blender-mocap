@@ -215,10 +215,13 @@ def _countdown_tick() -> float | None:
         props.status = "Previewing"
         return None
 
-    _countdown_remaining -= 1
-
     if _countdown_remaining > 0:
         props.status = f"Recording in {_countdown_remaining}..."
+        _countdown_remaining -= 1
+        # Force UI redraw so countdown is visible
+        for area in bpy.context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
         return 1.0  # Next tick in 1 second
 
     # Countdown finished — start recording
@@ -227,6 +230,9 @@ def _countdown_tick() -> float | None:
     _ipc_client.send_command("start_recording")
     props.is_recording = True
     props.status = "Recording"
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
     return None
 
 
@@ -243,7 +249,11 @@ class MOCAP_OT_start_recording(Operator):
             return {"CANCELLED"}
 
         _countdown_remaining = 5
-        props.status = f"Recording in {_countdown_remaining}..."
+        props.status = "Recording in 5..."
+        # Force immediate UI redraw
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
         bpy.app.timers.register(_countdown_tick, first_interval=1.0)
         return {"FINISHED"}
 
@@ -498,6 +508,32 @@ def _poll_poses() -> float | None:
     return 0.033  # ~30Hz
 
 
+class MOCAP_OT_reset_pose(Operator):
+    bl_idname = "mocap.reset_pose"
+    bl_label = "Reset Pose"
+    bl_description = "Reset armature to its default rest pose"
+
+    def execute(self, context):
+        global _initial_root_position
+        props = context.scene.mocap
+        if props.target_armature is None:
+            self.report({"ERROR"}, "No armature selected")
+            return {"CANCELLED"}
+
+        armature = props.target_armature
+        for pb in armature.pose.bones:
+            pb.rotation_mode = "QUATERNION"
+            pb.rotation_quaternion = (1, 0, 0, 0)
+            pb.location = (0, 0, 0)
+            pb.scale = (1, 1, 1)
+
+        _initial_root_position = None
+        armature.update_tag()
+        bpy.context.view_layer.update()
+        self.report({"INFO"}, "Pose reset to default")
+        return {"FINISHED"}
+
+
 class MOCAP_OT_select_recording(Operator):
     bl_idname = "mocap.select_recording"
     bl_label = "Select Recording"
@@ -519,6 +555,7 @@ CLASSES = [
     MOCAP_OT_export_fbx,
     MOCAP_OT_export_bvh,
     MOCAP_OT_export_audio,
+    MOCAP_OT_reset_pose,
     MOCAP_OT_select_recording,
 ]
 
