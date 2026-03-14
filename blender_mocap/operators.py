@@ -514,7 +514,9 @@ def _poll_poses() -> float | None:
     if props.target_armature:
         result = apply_pose_to_armature(landmarks, props.target_armature)
 
-        # Apply root motion — track position relative to first frame
+        # Apply root motion — track lateral (X) and depth (Y) position only
+        # Vertical (Z) is NOT applied because hip midpoint shifts when lifting
+        # a leg, which would make the static leg appear to drift
         if "_root_position" in result and "root" in props.target_armature.pose.bones:
             global _initial_root_position
             pos = result["_root_position"]
@@ -522,8 +524,8 @@ def _poll_poses() -> float | None:
                 _initial_root_position = pos
             dx = (pos[0] - _initial_root_position[0]) * _root_scale
             dy = (pos[1] - _initial_root_position[1]) * _root_scale
-            dz = (pos[2] - _initial_root_position[2]) * _root_scale
-            props.target_armature.pose.bones["root"].location = (dx, dy, dz)
+            # No dz — vertical movement comes from leg/spine rotations
+            props.target_armature.pose.bones["root"].location = (dx, dy, 0.0)
 
         # Force viewport update
         props.target_armature.update_tag()
