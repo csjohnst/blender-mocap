@@ -35,8 +35,22 @@ CHEST_BONE = "chest"
 HEAD_BONE = "head"
 TORSO_BONE = "torso"
 
+# FK chain parent relationships: child -> parent
+# Used to subtract parent's world rotation from child's delta
+FK_CHAIN_PARENT = {
+    "forearm_fk.L": "upper_arm_fk.L",
+    "forearm_fk.R": "upper_arm_fk.R",
+    "hand_fk.L":    "forearm_fk.L",
+    "hand_fk.R":    "forearm_fk.R",
+    "shin_fk.L":    "thigh_fk.L",
+    "shin_fk.R":    "thigh_fk.R",
+    "foot_fk.L":    "shin_fk.L",
+    "foot_fk.R":    "shin_fk.R",
+}
+
 # Calibration state
 _calib_rotations = {}  # bone_name -> Quaternion (absolute rotation at calibration)
+_calib_dirs = {}       # bone_name -> Vector (direction at calibration, for chain correction)
 _calib_body_angle = 0.0
 _is_calibrated = False
 _latest_landmarks = None
@@ -86,10 +100,11 @@ def _compute_absolute_rotation(rest_bone, target_dir):
 def calibrate(landmarks: list[dict]) -> None:
     """Store the current pose as calibration reference."""
     from mathutils import Vector
-    global _calib_rotations, _calib_body_angle, _is_calibrated
+    global _calib_rotations, _calib_dirs, _calib_body_angle, _is_calibrated
 
     coords = [Vector(mediapipe_to_blender_coords(lm)) for lm in landmarks]
     _calib_rotations = {}
+    _calib_dirs = {}
 
     print("[MoCap] === CALIBRATION ===")
 
@@ -104,6 +119,7 @@ def calibrate(landmarks: list[dict]) -> None:
             continue
         abs_rot = _compute_absolute_rotation(rest_bone, target_dir)
         _calib_rotations[bone_name] = abs_rot
+        _calib_dirs[bone_name] = target_dir.copy()
         print(f"  {bone_name}: target=({target_dir.x:.3f}, {target_dir.y:.3f}, {target_dir.z:.3f})")
 
     # Calibrate spine
@@ -128,9 +144,11 @@ def calibrate(landmarks: list[dict]) -> None:
         _calib_rotations[HEAD_BONE] = abs_rot
         print(f"  {HEAD_BONE}: face_up=({face_up.x:.3f}, {face_up.y:.3f}, {face_up.z:.3f})")
 
-    # Calibrate body angle
+    # Calibrate body angle (average of shoulder and hip lines)
     shoulder_vec = (coords[12] - coords[11]).normalized()
-    _calib_body_angle = math.atan2(shoulder_vec.y, shoulder_vec.x)
+    hip_vec = (coords[24] - coords[23]).normalized()
+    _calib_body_angle = (math.atan2(shoulder_vec.y, shoulder_vec.x) +
+                         math.atan2(hip_vec.y, hip_vec.x)) / 2
     print(f"  body_angle: {math.degrees(_calib_body_angle):.1f}°")
 
     _is_calibrated = True
@@ -200,9 +218,15 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
     # --- TORSO ROTATION ---
     if TORSO_BONE in armature.pose.bones:
         pb = armature.pose.bones[TORSO_BONE]
+        # Average shoulder and hip lines for more stable body rotation
         shoulder_vec = (coords[12] - coords[11]).normalized()
-        current_angle = math.atan2(shoulder_vec.y, shoulder_vec.x)
-        delta_angle = current_angle - _calib_body_angle
+        hip_vec = (coords[24] - coords[23]).normalized()
+        avg_angle = (math.atan2(shoulder_vec.y, shoulder_vec.x) +
+                     math.atan2(hip_vec.y, hip_vec.x)) / 2
+        delta_angle = avg_angle - _calib_body_angle
+        # Dead zone: ignore tiny rotations (< 5 degrees) to prevent leg crosstalk
+        if abs(delta_angle) < math.radians(5):
+            delta_angle = 0.0
         pb.rotation_mode = "QUATERNION"
         pb.rotation_quaternion = Quaternion(Vector((0, 0, 1)), -delta_angle)
 
@@ -239,6 +263,9 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             pb.rotation_quaternion = delta
 
     # --- LIMBS ---
+    # Store current directions for chain parent lookups
+    current_dirs = {}
+
     for bone_name, mapping in RIGIFY_BONE_MAP.items():
         if bone_name not in armature.pose.bones:
             continue
@@ -254,12 +281,44 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
         if target_dir.length < 1e-6:
             continue
 
-        current_abs = _compute_absolute_rotation(rest_bone, target_dir)
-        calib_abs = _calib_rotations[bone_name]
-        delta = calib_abs.inverted() @ current_abs
+        current_dirs[bone_name] = target_dir
 
-        pb.rotation_mode = "QUATERNION"
-        pb.rotation_quaternion = delta
+        # Check if this bone is a chain child (forearm, shin, hand, foot)
+        fk_parent = FK_CHAIN_PARENT.get(bone_name)
+
+        if fk_parent and fk_parent in _calib_dirs and fk_parent in current_dirs:
+            # CHAIN CHILD: subtract parent's world rotation from our delta
+            # Parent's world rotation = how much the parent moved since calibration
+            parent_calib_dir = _calib_dirs[fk_parent]
+            parent_current_dir = current_dirs[fk_parent]
+            parent_world_rot = parent_calib_dir.rotation_difference(parent_current_dir)
+
+            # Where this bone WOULD be if only the parent moved (no elbow/knee bend)
+            child_calib_dir = _calib_dirs[bone_name]
+            expected_dir = parent_world_rot @ child_calib_dir
+
+            # This bone's OWN rotation = from expected to actual
+            own_delta_dir = expected_dir.rotation_difference(target_dir)
+
+            # Convert to bone-local using rest_local
+            if rest_bone.parent:
+                rest_local = rest_bone.parent.matrix_local.inverted() @ rest_bone.matrix_local
+            else:
+                rest_local = rest_bone.matrix_local
+
+            bone_orient = rest_local.to_3x3()
+            local_rot = (bone_orient.inverted() @ own_delta_dir.to_matrix() @ bone_orient).to_quaternion()
+
+            pb.rotation_mode = "QUATERNION"
+            pb.rotation_quaternion = local_rot
+        else:
+            # ROOT BONE: use the simple calib delta approach
+            current_abs = _compute_absolute_rotation(rest_bone, target_dir)
+            calib_abs = _calib_rotations[bone_name]
+            delta = calib_abs.inverted() @ current_abs
+
+            pb.rotation_mode = "QUATERNION"
+            pb.rotation_quaternion = delta
 
     # Root position
     hip_mid = (coords[23] + coords[24]) / 2
