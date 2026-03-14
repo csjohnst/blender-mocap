@@ -13,11 +13,32 @@ class Camera:
         self._cap: cv2.VideoCapture | None = None
 
     def open(self) -> None:
-        # Open by device path, not index — avoids mismatch when
-        # metadata nodes are filtered out (e.g. /dev/video2 != index 2)
-        self._cap = cv2.VideoCapture(self._device_path)
+        import os
+        import stat
+        path = self._device_path
+
+        # Check device exists and is accessible before OpenCV attempt
+        if not os.path.exists(path):
+            raise RuntimeError(f"Camera device {path} does not exist")
+        try:
+            st = os.stat(path)
+            if not stat.S_ISCHR(st.st_mode):
+                raise RuntimeError(f"{path} is not a character device")
+            # Check read/write access
+            if not os.access(path, os.R_OK | os.W_OK):
+                import getpass
+                user = getpass.getuser()
+                raise RuntimeError(
+                    f"Permission denied on {path} — "
+                    f"add user '{user}' to the 'video' group: "
+                    f"sudo usermod -aG video {user}"
+                )
+        except OSError as e:
+            raise RuntimeError(f"Cannot access {path}: {e}")
+
+        self._cap = cv2.VideoCapture(path)
         if not self._cap.isOpened():
-            raise RuntimeError(f"Cannot open camera at {self._device_path}")
+            raise RuntimeError(f"Cannot open camera at {path} — device may be in use by another application")
 
     def read(self) -> tuple[bool, np.ndarray | None]:
         if self._cap is None:
