@@ -7,7 +7,10 @@ from bpy.types import Operator
 from .ipc_client import IPCClient
 from .subprocess_manager import CaptureProcess, get_recordings_path
 from .recording import FrameBuffer, bake_to_action, next_action_name
-from .rigify_mapper import apply_pose_to_armature, compute_limb_rotations, reset_debug_counter
+from .rigify_mapper import (
+    apply_pose_to_armature, compute_limb_rotations, reset_debug_counter,
+    calibrate, clear_calibration,
+)
 from .export import export_blend_action, export_fbx, export_bvh, copy_audio_file
 
 # Global state (persists across operator invocations)
@@ -18,6 +21,7 @@ _last_message_time = 0.0
 _bone_rest_vectors: dict = {}
 _initial_root_position: tuple | None = None  # First frame hip position for delta tracking
 _root_scale: float = 5.0  # Scale factor: MediaPipe normalized coords -> Blender units
+_latest_landmarks: list | None = None  # Most recent landmarks for calibration
 
 
 def _get_bone_rest_vectors(armature) -> dict:
@@ -140,8 +144,9 @@ class MOCAP_OT_start_preview(Operator):
         _ipc_client.send_command("start_preview")
         _last_message_time = time.time()
 
-        # Switch Rigify limbs to FK mode and reset debug
+        # Switch Rigify limbs to FK mode, reset calibration and debug
         _switch_to_fk(props.target_armature)
+        clear_calibration()
         reset_debug_counter()
         _bone_rest_vectors = _get_bone_rest_vectors(props.target_armature)
         global _initial_root_position
@@ -472,6 +477,10 @@ def _poll_poses() -> float | None:
     landmarks = pose["landmarks"]
     timestamp = pose["timestamp"]
 
+    # Store for calibration
+    global _latest_landmarks
+    _latest_landmarks = landmarks
+
     # Buffer if recording
     if props.is_recording:
         _frame_buffer.add(timestamp, landmarks)
@@ -501,8 +510,8 @@ def _poll_poses() -> float | None:
 
 class MOCAP_OT_reset_pose(Operator):
     bl_idname = "mocap.reset_pose"
-    bl_label = "Reset Pose"
-    bl_description = "Reset armature to its default rest pose"
+    bl_label = "Calibrate / Reset"
+    bl_description = "Reset armature to rest pose and calibrate: your current pose becomes the A-pose reference"
 
     def execute(self, context):
         global _initial_root_position
@@ -511,6 +520,7 @@ class MOCAP_OT_reset_pose(Operator):
             self.report({"ERROR"}, "No armature selected")
             return {"CANCELLED"}
 
+        # Reset armature to rest pose
         armature = props.target_armature
         for pb in armature.pose.bones:
             pb.rotation_mode = "QUATERNION"
@@ -519,9 +529,18 @@ class MOCAP_OT_reset_pose(Operator):
             pb.scale = (1, 1, 1)
 
         _initial_root_position = None
+        reset_debug_counter()
+
+        # Calibrate using latest landmarks if preview is active
+        if _latest_landmarks is not None:
+            calibrate(_latest_landmarks)
+            self.report({"INFO"}, "Calibrated — your current pose is now the reference")
+        else:
+            clear_calibration()
+            self.report({"INFO"}, "Pose reset (start preview to calibrate)")
+
         armature.update_tag()
         bpy.context.view_layer.update()
-        self.report({"INFO"}, "Pose reset to default")
         return {"FINISHED"}
 
 

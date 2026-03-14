@@ -34,7 +34,7 @@ class TestCoordinateTransform:
         lm_far = {"x": 0.5, "y": 0.5, "z": 0.5}
         _, by_near, _ = mediapipe_to_blender_coords(lm_near)
         _, by_far, _ = mediapipe_to_blender_coords(lm_far)
-        assert by_near > by_far  # Closer to camera = forward (+Y)
+        assert by_near < by_far  # Closer to camera = -Y (character faces camera)
 
 
 class TestBoneMap:
