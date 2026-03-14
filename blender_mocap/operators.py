@@ -7,7 +7,7 @@ from bpy.types import Operator
 from .ipc_client import IPCClient
 from .subprocess_manager import CaptureProcess, get_recordings_path
 from .recording import FrameBuffer, bake_to_action, next_action_name
-from .rigify_mapper import apply_pose_to_armature, compute_limb_rotations
+from .rigify_mapper import apply_pose_to_armature, compute_limb_rotations, reset_debug_counter
 from .export import export_blend_action, export_fbx, export_bvh, copy_audio_file
 
 # Global state (persists across operator invocations)
@@ -140,8 +140,9 @@ class MOCAP_OT_start_preview(Operator):
         _ipc_client.send_command("start_preview")
         _last_message_time = time.time()
 
-        # Switch Rigify limbs to FK mode and cache rest vectors
+        # Switch Rigify limbs to FK mode and reset debug
         _switch_to_fk(props.target_armature)
+        reset_debug_counter()
         _bone_rest_vectors = _get_bone_rest_vectors(props.target_armature)
         global _initial_root_position
         _initial_root_position = None  # Reset — will be set from first pose frame
