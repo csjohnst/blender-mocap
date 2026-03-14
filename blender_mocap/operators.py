@@ -356,6 +356,15 @@ def _poll_poses() -> float | None:
     if pose is not None or other_msgs:
         _last_message_time = now
 
+    # Check for server-reported errors
+    for msg in other_msgs:
+        if msg.get("type") == "error":
+            props.status = f"Error: {msg.get('message', 'Unknown error')}"
+            props.is_previewing = False
+            _ipc_client.close()
+            _capture_process.stop()
+            return None
+
     if pose is None:
         return 0.033  # Continue polling
     landmarks = pose["landmarks"]
