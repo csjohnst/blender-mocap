@@ -1,16 +1,13 @@
 # blender_mocap/rigify_mapper.py
 """Maps MediaPipe pose landmarks to Rigify armature bone rotations.
 
-Uses Blender's mathutils for proper bone-local rotation calculation.
-Each bone's rotation is computed by:
-1. Getting the world-space target direction from MediaPipe landmarks
-2. Converting to the bone's local space using its rest-pose matrix
-3. Computing the rotation from the bone's rest direction to the target
+Uses pose_bone.matrix (armature-space) to set bone orientations directly.
+Blender internally decomposes this into the correct parent-relative
+rotation_quaternion, handling the bone chain hierarchy automatically.
 
-This correctly handles bone chains where child rotations are relative
-to their parent's orientation.
+This avoids the error-prone manual bone-local rotation math that breaks
+on chains where child rotations compound with parent rotations.
 """
-import math
 
 
 def mediapipe_to_blender_coords(lm: dict) -> tuple[float, float, float]:
@@ -59,10 +56,10 @@ TORSO_BONE = "torso"
 
 
 def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
-    """Apply MediaPipe landmarks to a Rigify armature using proper bone-local rotations.
+    """Apply MediaPipe landmarks to a Rigify armature.
 
-    Uses Blender's mathutils to correctly handle bone hierarchies.
-    Must be called from Blender's Python context.
+    Sets each bone's armature-space matrix directly using pose_bone.matrix.
+    Blender handles decomposition into parent-relative rotation automatically.
 
     Args:
         landmarks: 33 MediaPipe landmarks with x, y, z, visibility.
@@ -71,7 +68,7 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
     Returns:
         dict with "_root_position" for root motion tracking.
     """
-    from mathutils import Vector, Quaternion, Matrix
+    from mathutils import Vector, Matrix
 
     coords = [Vector(mediapipe_to_blender_coords(lm)) for lm in landmarks]
     result = {}
@@ -82,113 +79,125 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             continue
 
         pb = armature.pose.bones[bone_name]
-        rest_bone = armature.data.bones[bone_name]
+        rest_bone = pb.bone
 
-        # Get target direction in world space
+        # Get target direction in armature space
         if mapping.get("type") == "foot":
             heel_idx, toe_idx = mapping["indices"]
-            target_world = (coords[toe_idx] - coords[heel_idx]).normalized()
+            target_dir = (coords[toe_idx] - coords[heel_idx]).normalized()
         else:
             parent_pos = coords[mapping["parent_idx"]]
             child_pos = coords[mapping["child_idx"]]
-            target_world = (child_pos - parent_pos).normalized()
+            target_dir = (child_pos - parent_pos).normalized()
 
-        if target_world.length < 1e-6:
+        if target_dir.length < 1e-6:
             continue
 
-        # Get the bone's rest direction in world space (bone.vector is in armature space)
-        rest_dir_armature = rest_bone.vector.normalized()
+        _set_bone_direction(pb, rest_bone, target_dir)
 
-        # Transform target direction from world space into armature space
-        # (for a basic setup these are the same, but handles armature transforms)
-        armature_mat_inv = armature.matrix_world.inverted()
-        target_armature = (armature_mat_inv.to_3x3() @ target_world).normalized()
-
-        # Convert target direction into the bone's LOCAL space
-        # The bone's rest matrix transforms from bone-local to armature space
-        # So its inverse transforms from armature to bone-local space
-        if rest_bone.parent:
-            # Parent's world-space rest matrix
-            parent_rest_mat = rest_bone.parent.matrix_local
-            # Bone's own rest matrix relative to parent
-            bone_rest_local = parent_rest_mat.inverted() @ rest_bone.matrix_local
-        else:
-            bone_rest_local = rest_bone.matrix_local
-
-        # Transform target into the bone's local coordinate frame
-        local_target = (bone_rest_local.inverted().to_3x3() @ target_armature).normalized()
-
-        # The bone's rest direction in its own local space is always along Y (tail - head)
-        local_rest = Vector((0, 1, 0))  # Blender bones point along +Y in local space
-
-        # Compute rotation from local rest to local target
-        rotation = local_rest.rotation_difference(local_target)
-
-        pb.rotation_mode = "QUATERNION"
-        pb.rotation_quaternion = rotation
-
-    # Chest/spine orientation from shoulders/hips
+    # Chest orientation from shoulders/hips
     if CHEST_BONE in armature.pose.bones:
         pb = armature.pose.bones[CHEST_BONE]
-        rest_bone = armature.data.bones[CHEST_BONE]
-
-        l_shoulder = coords[11]
-        r_shoulder = coords[12]
-        l_hip = coords[23]
-        r_hip = coords[24]
-        mid_hip = (l_hip + r_hip) / 2
-        mid_shoulder = (l_shoulder + r_shoulder) / 2
+        rest_bone = pb.bone
+        mid_hip = (coords[23] + coords[24]) / 2
+        mid_shoulder = (coords[11] + coords[12]) / 2
         spine_dir = (mid_shoulder - mid_hip).normalized()
-
         if spine_dir.length > 1e-6:
-            armature_mat_inv = armature.matrix_world.inverted()
-            target_armature = (armature_mat_inv.to_3x3() @ spine_dir).normalized()
-
-            if rest_bone.parent:
-                parent_rest_mat = rest_bone.parent.matrix_local
-                bone_rest_local = parent_rest_mat.inverted() @ rest_bone.matrix_local
-            else:
-                bone_rest_local = rest_bone.matrix_local
-
-            local_target = (bone_rest_local.inverted().to_3x3() @ target_armature).normalized()
-            local_rest = Vector((0, 1, 0))
-            rotation = local_rest.rotation_difference(local_target)
-
-            pb.rotation_mode = "QUATERNION"
-            pb.rotation_quaternion = rotation
+            _set_bone_direction(pb, rest_bone, spine_dir)
 
     # Head orientation from nose and ears
     if HEAD_BONE in armature.pose.bones:
         pb = armature.pose.bones[HEAD_BONE]
-        rest_bone = armature.data.bones[HEAD_BONE]
-
-        nose = coords[0]
-        l_ear = coords[7]
-        r_ear = coords[8]
-        ear_mid = (l_ear + r_ear) / 2
-        head_dir = (nose - ear_mid).normalized()
-
+        rest_bone = pb.bone
+        ear_mid = (coords[7] + coords[8]) / 2
+        head_dir = (coords[0] - ear_mid).normalized()
         if head_dir.length > 1e-6:
-            armature_mat_inv = armature.matrix_world.inverted()
-            target_armature = (armature_mat_inv.to_3x3() @ head_dir).normalized()
-
-            if rest_bone.parent:
-                parent_rest_mat = rest_bone.parent.matrix_local
-                bone_rest_local = parent_rest_mat.inverted() @ rest_bone.matrix_local
-            else:
-                bone_rest_local = rest_bone.matrix_local
-
-            local_target = (bone_rest_local.inverted().to_3x3() @ target_armature).normalized()
-            local_rest = Vector((0, 1, 0))
-            rotation = local_rest.rotation_difference(local_target)
-
-            pb.rotation_mode = "QUATERNION"
-            pb.rotation_quaternion = rotation
+            _set_bone_direction(pb, rest_bone, head_dir)
 
     # Root position (hip midpoint) for world-space translation
-    l_hip = coords[23]
-    r_hip = coords[24]
-    hip_mid = (l_hip + r_hip) / 2
+    hip_mid = (coords[23] + coords[24]) / 2
     result["_root_position"] = (hip_mid.x, hip_mid.y, hip_mid.z)
 
     return result
+
+
+def _set_bone_direction(pose_bone, rest_bone, target_dir):
+    """Set a bone to point in target_dir (armature space) while preserving roll.
+
+    Uses pose_bone.matrix to set the armature-space orientation directly.
+    Blender decomposes this into the correct parent-relative rotation.
+    """
+    from mathutils import Vector, Matrix
+
+    # Bone's rest direction in armature space
+    rest_dir = rest_bone.vector.normalized()
+
+    # Rotation from rest direction to target direction
+    rot = rest_dir.rotation_difference(target_dir)
+
+    # Apply rotation to the bone's rest matrix, keeping head position
+    rest_mat = rest_bone.matrix_local.copy()
+    head_pos = Vector(rest_bone.head_local)
+
+    # Rotate the rest matrix around the bone's head position
+    new_mat = (
+        Matrix.Translation(head_pos)
+        @ rot.to_matrix().to_4x4()
+        @ Matrix.Translation(-head_pos)
+        @ rest_mat
+    )
+
+    # Set the pose bone's armature-space matrix
+    # Blender automatically decomposes this into parent-relative transforms
+    pose_bone.matrix = new_mat
+
+
+# Keep compute_limb_rotations for backwards compat with recording.py bake
+def compute_limb_rotations(landmarks, bone_rest_vectors):
+    """Legacy function for recording bake — returns rotation dict."""
+    import math
+
+    def _normalize(v):
+        length = math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
+        if length < 1e-8:
+            return (0, 0, 1)
+        return (v[0]/length, v[1]/length, v[2]/length)
+
+    def _cross(a, b):
+        return (a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0])
+
+    def _dot(a, b):
+        return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+    def _bone_rot(rest, target):
+        rn = _normalize(rest)
+        tn = _normalize(target)
+        d = max(-1, min(1, _dot(rn, tn)))
+        if d > 0.9999:
+            return (1, 0, 0, 0)
+        if d < -0.9999:
+            perp = _normalize(_cross(rn, (1,0,0) if abs(rn[0])<0.9 else (0,1,0)))
+            return (0, perp[0], perp[1], perp[2])
+        axis = _normalize(_cross(rn, tn))
+        ha = math.acos(d) / 2
+        s = math.sin(ha)
+        return (math.cos(ha), axis[0]*s, axis[1]*s, axis[2]*s)
+
+    coords = [mediapipe_to_blender_coords(lm) for lm in landmarks]
+    rotations = {}
+
+    for bone_name, mapping in RIGIFY_BONE_MAP.items():
+        if bone_name not in bone_rest_vectors:
+            continue
+        rest_vec = bone_rest_vectors[bone_name]
+        if mapping.get("type") == "foot":
+            h, t = mapping["indices"]
+            tv = (coords[t][0]-coords[h][0], coords[t][1]-coords[h][1], coords[t][2]-coords[h][2])
+        else:
+            p, c = coords[mapping["parent_idx"]], coords[mapping["child_idx"]]
+            tv = (c[0]-p[0], c[1]-p[1], c[2]-p[2])
+        rotations[bone_name] = _bone_rot(rest_vec, tv)
+
+    l_hip, r_hip = coords[23], coords[24]
+    rotations["_root_position"] = ((l_hip[0]+r_hip[0])/2, (l_hip[1]+r_hip[1])/2, (l_hip[2]+r_hip[2])/2)
+    return rotations
