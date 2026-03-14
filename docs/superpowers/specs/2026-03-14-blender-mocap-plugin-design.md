@@ -7,7 +7,7 @@
 
 ## Overview
 
-A Blender addon that captures human motion from a webcam using MediaPipe pose estimation and applies it to a Rigify armature in real-time. Supports live preview, recording, post-capture smoothing, and export to .blend, FBX, and BVH formats.
+A Blender addon that captures human motion from a webcam using MediaPipe pose estimation and applies it to a Rigify armature in real-time. Supports live preview, recording, post-capture smoothing, export to .blend/FBX/BVH, and synchronized audio capture from a webcam mic or system microphone.
 
 ## Architecture
 
@@ -39,6 +39,8 @@ Two-process architecture for isolation and performance:
   - `{"type": "command", "action": "start_preview"}` — begin camera capture and pose estimation
   - `{"type": "command", "action": "stop_preview"}` — stop capture, close preview window
   - `{"type": "command", "action": "shutdown"}` — terminate the capture process cleanly
+  - `{"type": "command", "action": "start_recording"}` — begin buffering audio (capture server starts writing audio to file)
+  - `{"type": "command", "action": "stop_recording"}` — stop audio recording, finalize file
 - **Direction:** Bidirectional. Data flows server→client, commands flow client→server. The addon sends `shutdown` on Stop or when Blender closes; the subprocess also exits if the socket disconnects (Blender crash cleanup).
 - **Backpressure:** When the Blender timer drains the socket, it reads all available messages and discards all but the most recent pose. This ensures the addon always uses the freshest data and doesn't fall behind.
 - **Liveness:** The capture server sends `{"type": "heartbeat"}` every 2 seconds when idle (no pose data flowing). The Blender addon considers the server dead if no message of any type is received for 5 seconds, at which point it cleans up and shows an error. The capture server detects Blender disconnect by a broken pipe or empty read on the socket and exits.
@@ -100,9 +102,9 @@ MediaPipe provides Z-depth per landmark relative to the hip midpoint. This gives
 
 ### Recording
 
-- User clicks Record — addon starts buffering raw landmark data with timestamps
+- User clicks Record — addon starts buffering raw landmark data with timestamps and sends `start_recording` command to capture server to begin audio capture
 - Poses continue to be applied live during recording
-- User clicks Stop — buffer is baked into a Blender Action:
+- User clicks Stop — sends `stop_recording` to capture server (finalizes audio file), then buffer is baked into a Blender Action:
   - Raw landmarks converted to bone rotations
   - Keyframes inserted with FPS resampling: timestamps are converted to scene frames using `frame = timestamp * scene_fps`. If camera FPS differs from scene FPS, landmark data is linearly interpolated to align with scene frame boundaries. Linear interpolation is acceptable for the initial version; the post-capture F-curve smoothing pass addresses any resulting stiffness.
   - Action auto-named `MoCap_001`, `MoCap_002`, etc.
@@ -127,13 +129,44 @@ The UI exposes a single "Smoothing" slider (0.0–1.0). This maps to the one-eur
 
 Blender's built-in F-curve smooth operator applied to baked keyframes. User-adjustable strength.
 
+## Audio Capture
+
+Audio is recorded alongside motion capture for later use in rendering.
+
+### Audio Source Selection
+
+- UI provides a dropdown of available audio input devices (populated via `sounddevice.query_devices()` filtered to inputs)
+- Options include webcam microphones, USB mics, and system audio inputs
+- Default: the system's default input device
+
+### Recording
+
+- Audio recording starts/stops in sync with motion recording via the `start_recording`/`stop_recording` IPC commands
+- The capture server records audio on a separate thread using `sounddevice` (PortAudio bindings)
+- Audio is saved as a WAV file alongside the motion data: `~/.blender-mocap/recordings/MoCap_001.wav`
+- Sample rate: 44100 Hz, 16-bit, mono (sufficient for voice/dialogue)
+
+### Synchronization
+
+- Audio and pose recording are started by the same command, so they share a common start timestamp
+- On bake, the addon reports the audio file path and its time offset relative to the Action's first frame
+- The user can import the WAV into Blender's Video Sequence Editor or use it externally during render
+
+### Audio File Management
+
+- Audio files are listed alongside their corresponding Action in the Recordings panel
+- Delete removes both the Action and the associated audio file
+- Audio files persist at `~/.blender-mocap/recordings/` and survive Blender restarts
+
 ## Export
 
-Three export formats:
+Three export formats for motion, plus audio:
 
 1. **`.blend` Action** — uses `bpy.data.libraries.write()` to save the Action data block to an external `.blend` file. Can be appended/linked into other Blender projects via File → Append.
 2. **FBX** — industry-standard exchange format. Exports armature + action.
 3. **BVH** — motion capture standard. Exports skeletal animation data only.
+
+4. **Audio (WAV)** — exports the associated audio file. Included automatically when exporting motion if an audio file exists for that recording.
 
 Export operates on the selected recording from the Recordings list.
 
@@ -144,6 +177,7 @@ Sidebar panel in 3D Viewport N-panel, category "Motion Capture". Four collapsibl
 ### Setup
 - Camera dropdown — auto-detects `/dev/video*` devices
 - Target Armature — object picker filtered to armatures that have a `rig_id` custom property (set by Rigify's Generate Rig operator)
+- Audio Source dropdown — auto-detects input devices (mics), default: system default input
 - Smoothing slider — real-time filter strength (0.0–1.0)
 
 ### Capture
@@ -153,13 +187,14 @@ Sidebar panel in 3D Viewport N-panel, category "Motion Capture". Four collapsibl
 - Status label — Idle / Previewing / Recording (frame count)
 
 ### Recordings
-- List of captured Actions with frame counts
+- List of captured Actions with frame counts and audio indicator
 - Smooth button — apply post-capture smoothing to selected recording
-- Delete button — remove selected recording
+- Delete button — remove selected recording (and associated audio file)
 
 ### Export
-- Three buttons: .blend, FBX, BVH
+- Four buttons: .blend, FBX, BVH, Audio (WAV)
 - Opens file browser for save location
+- Audio file automatically copied alongside motion export when available
 
 ## Project Structure
 
@@ -182,7 +217,8 @@ blender-mocap/
 │       ├── preview.py              # OpenCV skeleton overlay window
 │       ├── ipc_server.py           # Unix socket server
 │       ├── smoothing.py            # One-euro filter
-│       └── requirements.txt        # mediapipe, opencv-python, numpy
+│       ├── audio.py                # Audio capture via sounddevice
+│       └── requirements.txt        # mediapipe, opencv-python, numpy, sounddevice
 ├── tests/
 │   ├── test_rigify_mapper.py
 │   ├── test_ipc.py
@@ -197,6 +233,7 @@ blender-mocap/
 - `mediapipe` — pose estimation
 - `opencv-python` — webcam capture and preview
 - `numpy` — math operations
+- `sounddevice` — audio capture (PortAudio bindings)
 
 ### Blender Addon
 - Pure Python, no external dependencies
