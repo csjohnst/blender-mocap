@@ -114,8 +114,9 @@ def main() -> None:
                 running = False
                 continue
 
-        # Capture and process frame
+        # Capture and process frame (throttled to ~30fps)
         if previewing:
+            frame_start = time.time()
             ret, frame = camera.read()
             pose_sent = False
             if ret and frame is not None:
@@ -135,6 +136,12 @@ def main() -> None:
                         running = False
             else:
                 time.sleep(0.001)
+
+            # Throttle to ~30fps to prevent CPU overload
+            elapsed = time.time() - frame_start
+            target_frame_time = 1.0 / 30.0
+            if elapsed < target_frame_time:
+                time.sleep(target_frame_time - elapsed)
             # Send heartbeat when no pose data (camera failure or no landmarks)
             if not pose_sent:
                 now = time.time()
