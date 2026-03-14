@@ -199,22 +199,52 @@ class MOCAP_OT_stop_preview(Operator):
         return {"FINISHED"}
 
 
+_countdown_remaining = 0
+
+
+def _countdown_tick() -> float | None:
+    """Timer callback for recording countdown."""
+    global _countdown_remaining, _frame_buffer, _initial_root_position
+
+    scene = bpy.context.scene
+    if not hasattr(scene, "mocap"):
+        return None
+    props = scene.mocap
+
+    if not props.is_previewing:
+        props.status = "Previewing"
+        return None
+
+    _countdown_remaining -= 1
+
+    if _countdown_remaining > 0:
+        props.status = f"Recording in {_countdown_remaining}..."
+        return 1.0  # Next tick in 1 second
+
+    # Countdown finished — start recording
+    _frame_buffer.clear()
+    _initial_root_position = None  # Reset root so recording starts from origin
+    _ipc_client.send_command("start_recording")
+    props.is_recording = True
+    props.status = "Recording"
+    return None
+
+
 class MOCAP_OT_start_recording(Operator):
     bl_idname = "mocap.start_recording"
     bl_label = "Record"
-    bl_description = "Start recording motion capture"
+    bl_description = "Start recording motion capture (5 second countdown)"
 
     def execute(self, context):
-        global _frame_buffer
+        global _countdown_remaining
         props = context.scene.mocap
         if not props.is_previewing:
             self.report({"ERROR"}, "Start preview first")
             return {"CANCELLED"}
 
-        _frame_buffer.clear()
-        _ipc_client.send_command("start_recording")
-        props.is_recording = True
-        props.status = "Recording"
+        _countdown_remaining = 5
+        props.status = f"Recording in {_countdown_remaining}..."
+        bpy.app.timers.register(_countdown_tick, first_interval=1.0)
         return {"FINISHED"}
 
 
