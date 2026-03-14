@@ -27,6 +27,7 @@ _frame_buffer = FrameBuffer()
 _last_message_time = 0.0
 _bone_rest_vectors: dict = {}
 _initial_root_position: tuple | None = None
+_initial_foot_z: float | None = None
 _root_scale: float = 5.0
 
 
@@ -514,18 +515,20 @@ def _poll_poses() -> float | None:
     if props.target_armature:
         result = apply_pose_to_armature(landmarks, props.target_armature)
 
-        # Apply root motion — track lateral (X) and depth (Y) position only
-        # Vertical (Z) is NOT applied because hip midpoint shifts when lifting
-        # a leg, which would make the static leg appear to drift
+        # Apply root motion — XY from hips, Z from lowest foot (jump detection)
+        # Using feet for vertical prevents drift when lifting one leg
+        # but still allows jumping (both feet leave ground)
         if "_root_position" in result and "root" in props.target_armature.pose.bones:
-            global _initial_root_position
+            global _initial_root_position, _initial_foot_z
             pos = result["_root_position"]
+            foot_z = result.get("_lowest_foot_z", 0.0)
             if _initial_root_position is None:
                 _initial_root_position = pos
+                _initial_foot_z = foot_z
             dx = (pos[0] - _initial_root_position[0]) * _root_scale
             dy = (pos[1] - _initial_root_position[1]) * _root_scale
-            # No dz — vertical movement comes from leg/spine rotations
-            props.target_armature.pose.bones["root"].location = (dx, dy, 0.0)
+            dz = (foot_z - _initial_foot_z) * _root_scale
+            props.target_armature.pose.bones["root"].location = (dx, dy, dz)
 
         # Force viewport update
         props.target_armature.update_tag()
@@ -555,6 +558,7 @@ class MOCAP_OT_reset_pose(Operator):
             pb.scale = (1, 1, 1)
 
         _initial_root_position = None
+        _initial_foot_z = None
 
         # Calibrate using latest landmarks if preview is active
         latest = get_latest_landmarks()

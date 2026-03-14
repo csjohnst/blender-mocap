@@ -320,9 +320,15 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             pb.rotation_mode = "QUATERNION"
             pb.rotation_quaternion = delta
 
-    # Root position
+    # Root position: hips for XY, lowest foot for Z (jump detection)
     hip_mid = (coords[23] + coords[24]) / 2
-    return {"_root_position": (hip_mid.x, hip_mid.y, hip_mid.z)}
+    # Use the lowest foot landmark (ankles 27, 28) for vertical reference
+    # If both feet go up, it's a jump. If only hips drop, feet stay grounded.
+    lowest_foot_z = min(coords[27].z, coords[28].z)
+    return {
+        "_root_position": (hip_mid.x, hip_mid.y, hip_mid.z),
+        "_lowest_foot_z": lowest_foot_z,
+    }
 
 
 # Legacy function for recording.py bake
