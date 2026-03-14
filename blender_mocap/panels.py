@@ -12,7 +12,9 @@ class MOCAP_PT_main(Panel):
     bl_category = "Motion Capture"
 
     def draw(self, context):
-        pass  # Sub-panels handle drawing
+        from . import bl_info
+        version = ".".join(str(v) for v in bl_info["version"])
+        self.layout.label(text=f"v{version}", icon="INFO")
 
 
 class MOCAP_PT_setup(Panel):
