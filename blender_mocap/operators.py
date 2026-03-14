@@ -26,9 +26,9 @@ _ipc_client: IPCClient | None = None
 _frame_buffer = FrameBuffer()
 _last_message_time = 0.0
 _bone_rest_vectors: dict = {}
-_initial_anchor_pos: tuple | None = None
+_initial_root_xy: tuple | None = None
+_initial_root_z: float | None = None
 _root_scale: float = 5.0
-_root_dead_zone: float = 0.02  # ~2% of frame — below this, snap to zero
 
 
 def _get_bone_rest_vectors(armature) -> dict:
@@ -515,24 +515,17 @@ def _poll_poses() -> float | None:
     if props.target_armature:
         result = apply_pose_to_armature(landmarks, props.target_armature)
 
-        # Apply root motion using grounded foot as anchor
-        # The lowest foot determines position — keeps planted foot static
-        # Dead zone prevents micro-drift from MediaPipe jitter
-        if "_anchor_pos" in result and "root" in props.target_armature.pose.bones:
-            global _initial_anchor_pos
-            anchor = result["_anchor_pos"]
-            if _initial_anchor_pos is None:
-                _initial_anchor_pos = anchor
-            dx = (anchor[0] - _initial_anchor_pos[0]) * _root_scale
-            dy = (anchor[1] - _initial_anchor_pos[1]) * _root_scale
-            dz = (anchor[2] - _initial_anchor_pos[2]) * _root_scale
-            # Dead zone: if the grounded foot barely moved, snap to zero
-            if abs(anchor[0] - _initial_anchor_pos[0]) < _root_dead_zone:
-                dx = 0.0
-            if abs(anchor[1] - _initial_anchor_pos[1]) < _root_dead_zone:
-                dy = 0.0
-            if abs(anchor[2] - _initial_anchor_pos[2]) < _root_dead_zone:
-                dz = 0.0
+        # Apply root motion: hips for XY (walking), lowest foot for Z (jumping)
+        if "_root_xy" in result and "root" in props.target_armature.pose.bones:
+            global _initial_root_xy, _initial_root_z
+            xy = result["_root_xy"]
+            z = result["_root_z"]
+            if _initial_root_xy is None:
+                _initial_root_xy = xy
+                _initial_root_z = z
+            dx = (xy[0] - _initial_root_xy[0]) * _root_scale
+            dy = (xy[1] - _initial_root_xy[1]) * _root_scale
+            dz = (z - _initial_root_z) * _root_scale
             props.target_armature.pose.bones["root"].location = (dx, dy, dz)
 
         # Force viewport update
@@ -562,7 +555,8 @@ class MOCAP_OT_reset_pose(Operator):
             pb.location = (0, 0, 0)
             pb.scale = (1, 1, 1)
 
-        _initial_anchor_pos = None
+        _initial_root_xy = None
+        _initial_root_z = None
 
         # Calibrate using latest landmarks if preview is active
         latest = get_latest_landmarks()

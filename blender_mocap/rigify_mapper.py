@@ -263,76 +263,39 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             pb.rotation_quaternion = delta
 
     # --- LIMBS ---
-    # Compute all current directions first
-    current_dirs = {}
-    for bone_name, mapping in RIGIFY_BONE_MAP.items():
-        if bone_name not in _bone_cache:
-            continue
-        target_dir = _get_target_dir(coords, mapping)
-        if target_dir.length > 1e-6:
-            current_dirs[bone_name] = target_dir
-
+    # Same approach for ALL bones (root and chain children):
+    # Compute absolute rotation in bone's rest_local space, take calibration delta.
+    # For chain children this slightly over-counts the parent's rotation change,
+    # but it produces correct visible bending at elbows and knees.
     for bone_name, mapping in RIGIFY_BONE_MAP.items():
         if bone_name not in armature.pose.bones:
             continue
-        if bone_name not in _calib_rotations:
+        if bone_name not in _bone_cache:
             continue
-        if bone_name not in current_dirs:
+        if bone_name not in _calib_rotations:
             continue
 
         pb = armature.pose.bones[bone_name]
         rest_bone = _bone_cache[bone_name]
-        target_dir = current_dirs[bone_name]
-        fk_parent = FK_CHAIN_PARENT.get(bone_name)
+        target_dir = _get_target_dir(coords, mapping)
 
-        if fk_parent and fk_parent in _calib_dirs and fk_parent in current_dirs:
-            # CHAIN CHILD: compute JOINT ANGLE change
-            # Joint angle = rotation from parent direction to child direction
-            # This directly captures the elbow/knee bend
+        if target_dir.length < 1e-6:
+            continue
 
-            parent_calib = _calib_dirs[fk_parent]
-            parent_current = current_dirs[fk_parent]
-            child_calib = _calib_dirs[bone_name]
+        current_abs = _compute_absolute_rotation(rest_bone, target_dir)
+        calib_abs = _calib_rotations[bone_name]
+        delta = calib_abs.inverted() @ current_abs
 
-            # Joint configuration at calibration and now
-            calib_joint = parent_calib.rotation_difference(child_calib)
-            current_joint = parent_current.rotation_difference(target_dir)
+        pb.rotation_mode = "QUATERNION"
+        pb.rotation_quaternion = delta
 
-            # Change in joint angle since calibration
-            joint_delta = calib_joint.inverted() @ current_joint
-
-            # Convert world-space joint delta to bone-local frame
-            if rest_bone.parent:
-                rest_local = rest_bone.parent.matrix_local.inverted() @ rest_bone.matrix_local
-            else:
-                rest_local = rest_bone.matrix_local
-            bone_orient = rest_local.to_3x3()
-            local_rot = (bone_orient.inverted() @ joint_delta.to_matrix() @ bone_orient).to_quaternion()
-
-            pb.rotation_mode = "QUATERNION"
-            pb.rotation_quaternion = local_rot
-        else:
-            # ROOT BONE: use calibration delta approach
-            current_abs = _compute_absolute_rotation(rest_bone, target_dir)
-            calib_abs = _calib_rotations[bone_name]
-            delta = calib_abs.inverted() @ current_abs
-
-            pb.rotation_mode = "QUATERNION"
-            pb.rotation_quaternion = delta
-
-    # Root position: use the GROUNDED foot as anchor
-    # Whichever foot is lower (closer to ground) determines the root position
-    # This keeps the planted foot static during one-leg stands
-    left_ankle = coords[27]
-    right_ankle = coords[28]
-
-    if left_ankle.z <= right_ankle.z:
-        anchor = left_ankle
-    else:
-        anchor = right_ankle
+    # Root position: hip midpoint for XY (walking), lowest foot for Z (jumping)
+    hip_mid = (coords[23] + coords[24]) / 2
+    lowest_foot_z = min(coords[27].z, coords[28].z)
 
     return {
-        "_anchor_pos": (anchor.x, anchor.y, anchor.z),
+        "_root_xy": (hip_mid.x, hip_mid.y),
+        "_root_z": lowest_foot_z,
     }
 
 
