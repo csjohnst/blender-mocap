@@ -9,12 +9,15 @@ class Camera:
 
     def __init__(self, device_index: int = 0):
         self._device_index = device_index
+        self._device_path = f"/dev/video{device_index}"
         self._cap: cv2.VideoCapture | None = None
 
     def open(self) -> None:
-        self._cap = cv2.VideoCapture(self._device_index)
+        # Open by device path, not index — avoids mismatch when
+        # metadata nodes are filtered out (e.g. /dev/video2 != index 2)
+        self._cap = cv2.VideoCapture(self._device_path)
         if not self._cap.isOpened():
-            raise RuntimeError(f"Cannot open camera at /dev/video{self._device_index}")
+            raise RuntimeError(f"Cannot open camera at {self._device_path}")
 
     def read(self) -> tuple[bool, np.ndarray | None]:
         if self._cap is None:
