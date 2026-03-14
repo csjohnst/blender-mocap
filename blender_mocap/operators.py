@@ -216,9 +216,13 @@ class MOCAP_OT_stop_preview(Operator):
             props.is_recording = False
 
         if props.is_previewing:
-            _ipc_client.send_command("stop_preview")
-            _ipc_client.send_command("shutdown")
-            _ipc_client.close()
+            if _ipc_client is not None:
+                try:
+                    _ipc_client.send_command("stop_preview")
+                    _ipc_client.send_command("shutdown")
+                    _ipc_client.close()
+                except Exception:
+                    pass
             _capture_process.stop()
             props.is_previewing = False
 
@@ -549,7 +553,6 @@ class MOCAP_OT_reset_pose(Operator):
             pb.scale = (1, 1, 1)
 
         _initial_root_position = None
-        reset_debug_counter()
 
         # Calibrate using latest landmarks if preview is active
         latest = get_latest_landmarks()
@@ -601,10 +604,11 @@ def register():
 def unregister():
     # Cleanup subprocess on unregister
     if _capture_process.is_running():
-        try:
-            _ipc_client.send_command("shutdown")
-        except Exception:
-            pass
+        if _ipc_client is not None:
+            try:
+                _ipc_client.send_command("shutdown")
+            except Exception:
+                pass
         _capture_process.stop()
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
