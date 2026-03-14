@@ -70,7 +70,12 @@ def main() -> None:
             action = cmd.get("action", "")
             if action == "start_preview":
                 if not previewing:
-                    camera.open()
+                    try:
+                        camera.open()
+                    except RuntimeError as e:
+                        ipc.send({"type": "error", "message": str(e)})
+                        running = False
+                        continue
                     preview.open()
                     previewing = True
                     ipc.send({"type": "status", "state": "ready", "message": "Preview started"})
@@ -112,6 +117,7 @@ def main() -> None:
         # Capture and process frame
         if previewing:
             ret, frame = camera.read()
+            pose_sent = False
             if ret and frame is not None:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 landmarks = estimator.estimate(frame_rgb)
@@ -120,6 +126,8 @@ def main() -> None:
                     t = time.time()
                     smoothed = smoother(t, landmarks)
                     ipc.send({"type": "pose", "landmarks": smoothed, "timestamp": t})
+                    last_heartbeat = t
+                    pose_sent = True
                     if not preview.update(frame, smoothed):
                         running = False
                 else:
@@ -127,6 +135,15 @@ def main() -> None:
                         running = False
             else:
                 time.sleep(0.001)
+            # Send heartbeat when no pose data (camera failure or no landmarks)
+            if not pose_sent:
+                now = time.time()
+                if now - last_heartbeat >= heartbeat_interval:
+                    try:
+                        ipc.send_heartbeat()
+                        last_heartbeat = now
+                    except (OSError, BrokenPipeError):
+                        running = False
         else:
             # Not previewing — send heartbeats
             now = time.time()
