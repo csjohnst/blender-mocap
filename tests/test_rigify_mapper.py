@@ -3,7 +3,6 @@ import math
 import pytest
 from blender_mocap.rigify_mapper import (
     mediapipe_to_blender_coords,
-    compute_bone_rotation,
     RIGIFY_BONE_MAP,
 )
 
@@ -38,27 +37,6 @@ class TestCoordinateTransform:
         assert by_near > by_far  # Closer to camera = forward (+Y)
 
 
-class TestBoneRotation:
-    def test_identity_rotation(self):
-        # Vector pointing in same direction as rest should give identity quaternion
-        rest_vec = (0.0, 0.0, 1.0)
-        target_vec = (0.0, 0.0, 1.0)
-        q = compute_bone_rotation(rest_vec, target_vec)
-        # Identity quaternion: (1, 0, 0, 0) or close
-        assert q[0] == pytest.approx(1.0, abs=0.01)
-        assert abs(q[1]) < 0.01
-        assert abs(q[2]) < 0.01
-        assert abs(q[3]) < 0.01
-
-    def test_90_degree_rotation(self):
-        rest_vec = (0.0, 0.0, 1.0)
-        target_vec = (1.0, 0.0, 0.0)
-        q = compute_bone_rotation(rest_vec, target_vec)
-        # Should produce a 90-degree rotation
-        angle = 2 * math.acos(min(abs(q[0]), 1.0))
-        assert angle == pytest.approx(math.pi / 2, abs=0.1)
-
-
 class TestBoneMap:
     def test_has_required_bones(self):
         required = ["upper_arm_fk.L", "forearm_fk.L", "upper_arm_fk.R", "forearm_fk.R",
@@ -71,3 +49,16 @@ class TestBoneMap:
         for bone_name, mapping in RIGIFY_BONE_MAP.items():
             assert "parent_idx" in mapping or "indices" in mapping, \
                 f"Bone {bone_name} missing landmark indices"
+
+    def test_limb_bones_have_parent_child(self):
+        for bone_name, mapping in RIGIFY_BONE_MAP.items():
+            if mapping.get("type") != "foot":
+                assert "parent_idx" in mapping and "child_idx" in mapping
+                assert isinstance(mapping["parent_idx"], int)
+                assert isinstance(mapping["child_idx"], int)
+
+    def test_foot_bones_have_indices(self):
+        for bone_name, mapping in RIGIFY_BONE_MAP.items():
+            if mapping.get("type") == "foot":
+                assert "indices" in mapping
+                assert len(mapping["indices"]) == 2

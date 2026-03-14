@@ -7,7 +7,7 @@ from bpy.types import Operator
 from .ipc_client import IPCClient
 from .subprocess_manager import CaptureProcess, get_recordings_path
 from .recording import FrameBuffer, bake_to_action, next_action_name
-from .rigify_mapper import compute_limb_rotations
+from .rigify_mapper import apply_pose_to_armature, compute_limb_rotations
 from .export import export_blend_action, export_fbx, export_bvh, copy_audio_file
 
 # Global state (persists across operator invocations)
@@ -476,26 +476,16 @@ def _poll_poses() -> float | None:
         _frame_buffer.add(timestamp, landmarks)
         props.status = f"Recording ({_frame_buffer.frame_count} frames)"
 
-    # Apply to armature
-    if props.target_armature and _bone_rest_vectors:
-        rotations = compute_limb_rotations(landmarks, _bone_rest_vectors)
-        from mathutils import Quaternion as MQuaternion
-
-        for bone_name, quat in rotations.items():
-            if bone_name == "_root_position":
-                continue
-            if bone_name in props.target_armature.pose.bones:
-                pb = props.target_armature.pose.bones[bone_name]
-                pb.rotation_mode = "QUATERNION"
-                pb.rotation_quaternion = MQuaternion(quat)
+    # Apply to armature using proper bone-local rotations
+    if props.target_armature:
+        result = apply_pose_to_armature(landmarks, props.target_armature)
 
         # Apply root motion — track position relative to first frame
-        if "_root_position" in rotations and "root" in props.target_armature.pose.bones:
+        if "_root_position" in result and "root" in props.target_armature.pose.bones:
             global _initial_root_position
-            pos = rotations["_root_position"]
+            pos = result["_root_position"]
             if _initial_root_position is None:
                 _initial_root_position = pos
-            # Delta from initial position, scaled to Blender units
             dx = (pos[0] - _initial_root_position[0]) * _root_scale
             dy = (pos[1] - _initial_root_position[1]) * _root_scale
             dz = (pos[2] - _initial_root_position[2]) * _root_scale
