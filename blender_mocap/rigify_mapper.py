@@ -320,14 +320,19 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             pb.rotation_mode = "QUATERNION"
             pb.rotation_quaternion = delta
 
-    # Root position: hips for XY, lowest foot for Z (jump detection)
-    hip_mid = (coords[23] + coords[24]) / 2
-    # Use the lowest foot landmark (ankles 27, 28) for vertical reference
-    # If both feet go up, it's a jump. If only hips drop, feet stay grounded.
-    lowest_foot_z = min(coords[27].z, coords[28].z)
+    # Root position: use the GROUNDED foot as anchor
+    # Whichever foot is lower (closer to ground) determines the root position
+    # This keeps the planted foot static during one-leg stands
+    left_ankle = coords[27]
+    right_ankle = coords[28]
+
+    if left_ankle.z <= right_ankle.z:
+        anchor = left_ankle
+    else:
+        anchor = right_ankle
+
     return {
-        "_root_position": (hip_mid.x, hip_mid.y, hip_mid.z),
-        "_lowest_foot_z": lowest_foot_z,
+        "_anchor_pos": (anchor.x, anchor.y, anchor.z),
     }
 
 
