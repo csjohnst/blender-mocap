@@ -104,7 +104,7 @@ def calibrate(landmarks: list[dict]) -> None:
             continue
         abs_rot = _compute_absolute_rotation(rest_bone, target_dir)
         _calib_rotations[bone_name] = abs_rot
-        print(f"  {bone_name}: target={target_dir:.3f} abs_rot={abs_rot:.3f}")
+        print(f"  {bone_name}: target=({target_dir.x:.3f}, {target_dir.y:.3f}, {target_dir.z:.3f})")
 
     # Calibrate spine
     mid_hip = (coords[23] + coords[24]) / 2
@@ -113,7 +113,7 @@ def calibrate(landmarks: list[dict]) -> None:
     if CHEST_BONE in _bone_cache and spine_dir.length > 1e-6:
         abs_rot = _compute_absolute_rotation(_bone_cache[CHEST_BONE], spine_dir)
         _calib_rotations[CHEST_BONE] = abs_rot
-        print(f"  {CHEST_BONE}: target={spine_dir:.3f}")
+        print(f"  {CHEST_BONE}: target=({spine_dir.x:.3f}, {spine_dir.y:.3f}, {spine_dir.z:.3f})")
 
     # Calibrate head
     l_ear, r_ear, nose = coords[7], coords[8], coords[0]
@@ -126,7 +126,7 @@ def calibrate(landmarks: list[dict]) -> None:
     if HEAD_BONE in _bone_cache and face_up.length > 1e-6:
         abs_rot = _compute_absolute_rotation(_bone_cache[HEAD_BONE], face_up)
         _calib_rotations[HEAD_BONE] = abs_rot
-        print(f"  {HEAD_BONE}: face_up={face_up:.3f}")
+        print(f"  {HEAD_BONE}: face_up=({face_up.x:.3f}, {face_up.y:.3f}, {face_up.z:.3f})")
 
     # Calibrate body angle
     shoulder_vec = (coords[12] - coords[11]).normalized()
@@ -176,7 +176,8 @@ def _ensure_bone_cache(armature):
             print(f"[MoCap] WARNING: bone '{name}' not found in armature!")
         else:
             bone = _bone_cache[name]
-            print(f"[MoCap]   {name}: vector={bone.vector.normalized():.3f} parent={bone.parent.name if bone.parent else 'None'}")
+            v = bone.vector.normalized()
+            print(f"[MoCap]   {name}: vector=({v.x:.3f}, {v.y:.3f}, {v.z:.3f}) parent={bone.parent.name if bone.parent else 'None'}")
 
 
 def clear_bone_cache():
