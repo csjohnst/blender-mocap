@@ -61,9 +61,9 @@ class TestBoneRotation:
 
 class TestBoneMap:
     def test_has_required_bones(self):
-        required = ["upper_arm.L", "forearm.L", "upper_arm.R", "forearm.R",
-                     "thigh.L", "shin.L", "thigh.R", "shin.R",
-                     "foot.L", "foot.R"]
+        required = ["upper_arm_fk.L", "forearm_fk.L", "upper_arm_fk.R", "forearm_fk.R",
+                     "thigh_fk.L", "shin_fk.L", "thigh_fk.R", "shin_fk.R",
+                     "foot_fk.L", "foot_fk.R"]
         for bone in required:
             assert bone in RIGIFY_BONE_MAP, f"Missing mapping for {bone}"
 

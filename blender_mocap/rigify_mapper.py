@@ -1,6 +1,10 @@
 # blender_mocap/rigify_mapper.py
 """Maps MediaPipe pose landmarks to Rigify armature bone rotations.
 
+Uses the FK control bone names from a generated Rigify human rig
+(not the metarig names). Rigify FK bones use the pattern:
+  upper_arm.L (metarig) -> upper_arm_fk.L (generated)
+
 Coordinate transform: MediaPipe (image coords) -> Blender (right-handed, Z-up).
 Rotation calculation: compute direction vectors between landmarks, convert to
 quaternion rotations relative to each bone's rest pose.
@@ -68,37 +72,41 @@ def compute_bone_rotation(
     return (w, axis[0] * s, axis[1] * s, axis[2] * s)
 
 
-# Mapping: Rigify bone name -> landmark indices used to compute its rotation
+# Mapping: Rigify GENERATED rig FK control bone names -> MediaPipe landmark indices
+# These are the actual bone names after clicking "Generate Rig" in Rigify.
 # parent_idx/child_idx: direction vector from parent to child landmark
 RIGIFY_BONE_MAP = {
-    # Arms
-    "upper_arm.L": {"parent_idx": 11, "child_idx": 13},
-    "forearm.L":   {"parent_idx": 13, "child_idx": 15},
-    "hand.L":      {"parent_idx": 15, "child_idx": 19},  # wrist to index finger tip approx
-    "upper_arm.R": {"parent_idx": 12, "child_idx": 14},
-    "forearm.R":   {"parent_idx": 14, "child_idx": 16},
-    "hand.R":      {"parent_idx": 16, "child_idx": 20},
-    # Legs
-    "thigh.L":     {"parent_idx": 23, "child_idx": 25},
-    "shin.L":      {"parent_idx": 25, "child_idx": 27},
-    "thigh.R":     {"parent_idx": 24, "child_idx": 26},
-    "shin.R":      {"parent_idx": 26, "child_idx": 28},
-    # Feet -- use heel-to-toe vector
-    "foot.L":      {"indices": [29, 31], "type": "foot"},  # heel to foot index
-    "foot.R":      {"indices": [30, 32], "type": "foot"},  # heel to foot index
+    # Arms (FK control bones)
+    "upper_arm_fk.L": {"parent_idx": 11, "child_idx": 13},
+    "forearm_fk.L":   {"parent_idx": 13, "child_idx": 15},
+    "hand_fk.L":      {"parent_idx": 15, "child_idx": 19},
+    "upper_arm_fk.R": {"parent_idx": 12, "child_idx": 14},
+    "forearm_fk.R":   {"parent_idx": 14, "child_idx": 16},
+    "hand_fk.R":      {"parent_idx": 16, "child_idx": 20},
+    # Legs (FK control bones)
+    "thigh_fk.L":     {"parent_idx": 23, "child_idx": 25},
+    "shin_fk.L":      {"parent_idx": 25, "child_idx": 27},
+    "thigh_fk.R":     {"parent_idx": 24, "child_idx": 26},
+    "shin_fk.R":      {"parent_idx": 26, "child_idx": 28},
+    # Feet (FK control bones) -- use heel-to-toe vector
+    "foot_fk.L":      {"indices": [29, 31], "type": "foot"},
+    "foot_fk.R":      {"indices": [30, 32], "type": "foot"},
 }
 
-# Spine and head use composite calculations (multiple landmarks)
-SPINE_LANDMARKS = {
-    "shoulders": (11, 12),
-    "hips": (23, 24),
-}
+# Bones that need IK/FK switch set to FK (1.0)
+# The IK_FK property lives on the IK control bones
+IK_FK_SWITCH_BONES = [
+    "hand_ik.L",
+    "hand_ik.R",
+    "foot_ik.L",
+    "foot_ik.R",
+]
 
-HEAD_LANDMARKS = {
-    "nose": 0,
-    "left_ear": 7,
-    "right_ear": 8,
-}
+# Spine/head use composite calculations with Rigify generated names
+SPINE_BONE = "spine_fk"       # Lowest spine FK bone
+CHEST_BONE = "chest"          # Chest control
+HEAD_BONE = "head"            # Head control
+TORSO_BONE = "torso"          # Torso master control
 
 
 def compute_limb_rotations(
@@ -124,7 +132,6 @@ def compute_limb_rotations(
         rest_vec = bone_rest_vectors[bone_name]
 
         if mapping.get("type") == "foot":
-            # Foot: heel to toe vector
             heel_idx, toe_idx = mapping["indices"]
             target_vec = (
                 coords[toe_idx][0] - coords[heel_idx][0],
@@ -142,26 +149,25 @@ def compute_limb_rotations(
 
         rotations[bone_name] = compute_bone_rotation(rest_vec, target_vec)
 
-    # Torso orientation from shoulders/hips
-    if "spine" in bone_rest_vectors:
+    # Chest/spine orientation from shoulders/hips
+    if CHEST_BONE in bone_rest_vectors:
         l_shoulder = coords[11]
         r_shoulder = coords[12]
         l_hip = coords[23]
         r_hip = coords[24]
-        # Spine direction: hip midpoint to shoulder midpoint
         mid_hip = ((l_hip[0] + r_hip[0]) / 2, (l_hip[1] + r_hip[1]) / 2, (l_hip[2] + r_hip[2]) / 2)
         mid_shoulder = ((l_shoulder[0] + r_shoulder[0]) / 2, (l_shoulder[1] + r_shoulder[1]) / 2, (l_shoulder[2] + r_shoulder[2]) / 2)
         spine_vec = (mid_shoulder[0] - mid_hip[0], mid_shoulder[1] - mid_hip[1], mid_shoulder[2] - mid_hip[2])
-        rotations["spine"] = compute_bone_rotation(bone_rest_vectors["spine"], spine_vec)
+        rotations[CHEST_BONE] = compute_bone_rotation(bone_rest_vectors[CHEST_BONE], spine_vec)
 
     # Head orientation from nose and ears
-    if "spine.006" in bone_rest_vectors:
+    if HEAD_BONE in bone_rest_vectors:
         nose = coords[0]
         l_ear = coords[7]
         r_ear = coords[8]
         ear_mid = ((l_ear[0] + r_ear[0]) / 2, (l_ear[1] + r_ear[1]) / 2, (l_ear[2] + r_ear[2]) / 2)
         head_vec = (nose[0] - ear_mid[0], nose[1] - ear_mid[1], nose[2] - ear_mid[2])
-        rotations["spine.006"] = compute_bone_rotation(bone_rest_vectors["spine.006"], head_vec)
+        rotations[HEAD_BONE] = compute_bone_rotation(bone_rest_vectors[HEAD_BONE], head_vec)
 
     # Root position (hip midpoint)
     l_hip = coords[23]

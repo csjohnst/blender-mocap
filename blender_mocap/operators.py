@@ -19,15 +19,28 @@ _bone_rest_vectors: dict = {}
 
 
 def _get_bone_rest_vectors(armature) -> dict:
-    """Extract rest-pose direction vectors from a Rigify armature."""
-    from .rigify_mapper import RIGIFY_BONE_MAP
+    """Extract rest-pose direction vectors from a Rigify generated armature."""
+    from .rigify_mapper import RIGIFY_BONE_MAP, CHEST_BONE, HEAD_BONE
     vectors = {}
-    for bone_name in list(RIGIFY_BONE_MAP.keys()) + ["spine", "spine.006"]:
+    all_bones = list(RIGIFY_BONE_MAP.keys()) + [CHEST_BONE, HEAD_BONE]
+    for bone_name in all_bones:
         if bone_name in armature.data.bones:
             bone = armature.data.bones[bone_name]
             vec = bone.vector.normalized()
             vectors[bone_name] = (vec.x, vec.y, vec.z)
     return vectors
+
+
+def _switch_to_fk(armature) -> None:
+    """Switch all Rigify limbs to FK mode so we can set rotations directly."""
+    from .rigify_mapper import IK_FK_SWITCH_BONES
+    for ik_bone_name in IK_FK_SWITCH_BONES:
+        if ik_bone_name in armature.pose.bones:
+            pb = armature.pose.bones[ik_bone_name]
+            # Rigify stores IK/FK blend as a custom property
+            # 0.0 = IK, 1.0 = FK
+            if "IK_FK" in pb:
+                pb["IK_FK"] = 1.0
 
 
 class MOCAP_OT_start_preview(Operator):
@@ -125,7 +138,8 @@ class MOCAP_OT_start_preview(Operator):
         _ipc_client.send_command("start_preview")
         _last_message_time = time.time()
 
-        # Cache rest vectors
+        # Switch Rigify limbs to FK mode and cache rest vectors
+        _switch_to_fk(props.target_armature)
         _bone_rest_vectors = _get_bone_rest_vectors(props.target_armature)
 
         props.is_previewing = True
