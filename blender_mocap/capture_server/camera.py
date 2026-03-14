@@ -42,8 +42,20 @@ class Camera:
             self._cap = None
 
     @staticmethod
+    def get_device_name(index: int) -> str:
+        """Get human-readable name for a camera device index."""
+        import os
+        name_path = f"/sys/class/video4linux/video{index}/name"
+        try:
+            with open(name_path) as f:
+                return f.read().strip()
+        except OSError:
+            pass
+        return f"Camera {index}"
+
+    @staticmethod
     def list_devices() -> list[int]:
-        """Probe /dev/video* devices that can actually open."""
+        """Probe camera devices (indices 0-9) that can actually open."""
         devices = []
         for i in range(10):
             cap = cv2.VideoCapture(i)
@@ -51,3 +63,15 @@ class Camera:
                 devices.append(i)
                 cap.release()
         return devices
+
+    @staticmethod
+    def list_devices_with_names() -> list[tuple[int, str]]:
+        """Return list of (index, name) for available camera devices."""
+        result = []
+        for i in range(10):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                cap.release()
+                name = Camera.get_device_name(i)
+                result.append((i, name))
+        return result

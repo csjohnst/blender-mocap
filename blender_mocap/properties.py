@@ -13,14 +13,30 @@ from bpy.props import (
 from bpy.types import PropertyGroup
 
 
+def _get_camera_name(index: int) -> str:
+    """Get human-readable name for a camera device index via sysfs."""
+    import os
+    name_path = f"/sys/class/video4linux/video{index}/name"
+    try:
+        with open(name_path) as f:
+            return f.read().strip()
+    except OSError:
+        return f"Camera {index}"
+
+
 def get_camera_devices(self, context):
-    """Enumerate available video devices."""
-    items = []
+    """Enumerate available video devices by name."""
     import glob
+    items = []
     devices = sorted(glob.glob("/dev/video*"))
-    for i, dev in enumerate(devices):
+    for dev in devices:
         idx = dev.replace("/dev/video", "")
-        items.append((idx, f"Camera {idx} ({dev})", f"Use {dev}"))
+        try:
+            index = int(idx)
+        except ValueError:
+            continue
+        friendly_name = _get_camera_name(index)
+        items.append((idx, friendly_name, f"Use {dev}"))
     if not items:
         items.append(("NONE", "No cameras found", ""))
     return items
