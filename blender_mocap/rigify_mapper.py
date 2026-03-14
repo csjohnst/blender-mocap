@@ -52,8 +52,47 @@ FK_CHAIN_PARENT = {
 _calib_rotations = {}  # bone_name -> Quaternion (absolute rotation at calibration)
 _calib_dirs = {}       # bone_name -> Vector (direction at calibration, for chain correction)
 _calib_body_angle = 0.0
+_calib_torso_size = 0.0    # Average torso metric at calibration (for depth)
+_calib_shoulder_width = 0.0  # Shoulder width at calibration (for rotation)
 _is_calibrated = False
 _latest_landmarks = None
+
+
+def _compute_torso_metrics(landmarks_raw: list[dict]) -> tuple[float, float, float]:
+    """Compute torso size and rotation from the 4 torso landmarks (raw MediaPipe coords).
+
+    Uses image-plane measurements (X, Y only — not depth Z) which are reliable.
+
+    Returns: (torso_size, shoulder_width_xy, body_rotation_rad)
+
+    torso_size: average of shoulder width, hip width, and torso height in image coords.
+                Inversely proportional to depth (closer = bigger).
+    shoulder_width_xy: apparent shoulder width in image plane.
+    body_rotation_rad: estimated body rotation from shoulder width foreshortening.
+    """
+    # Use RAW MediaPipe coords (image plane) for size — these are reliable
+    ls = landmarks_raw[11]  # left shoulder
+    rs = landmarks_raw[12]  # right shoulder
+    lh = landmarks_raw[23]  # left hip
+    rh = landmarks_raw[24]  # right hip
+
+    # Shoulder width in image plane
+    shoulder_w = math.sqrt((rs["x"] - ls["x"])**2 + (rs["y"] - ls["y"])**2)
+
+    # Hip width in image plane
+    hip_w = math.sqrt((rh["x"] - lh["x"])**2 + (rh["y"] - lh["y"])**2)
+
+    # Torso height: shoulder midpoint to hip midpoint
+    sm_x = (ls["x"] + rs["x"]) / 2
+    sm_y = (ls["y"] + rs["y"]) / 2
+    hm_x = (lh["x"] + rh["x"]) / 2
+    hm_y = (lh["y"] + rh["y"]) / 2
+    torso_h = math.sqrt((sm_x - hm_x)**2 + (sm_y - hm_y)**2)
+
+    # Average size metric (stable — combines 3 measurements)
+    torso_size = (shoulder_w + hip_w + torso_h) / 3
+
+    return torso_size, shoulder_w, 0.0
 
 
 def mediapipe_to_blender_coords(lm: dict) -> tuple[float, float, float]:
@@ -101,10 +140,15 @@ def calibrate(landmarks: list[dict]) -> None:
     """Store the current pose as calibration reference."""
     from mathutils import Vector
     global _calib_rotations, _calib_dirs, _calib_body_angle, _is_calibrated
+    global _calib_torso_size, _calib_shoulder_width
 
     coords = [Vector(mediapipe_to_blender_coords(lm)) for lm in landmarks]
     _calib_rotations = {}
     _calib_dirs = {}
+
+    # Store torso metrics for depth estimation
+    _calib_torso_size, _calib_shoulder_width, _ = _compute_torso_metrics(landmarks)
+    print(f"  torso_size: {_calib_torso_size:.4f}, shoulder_width: {_calib_shoulder_width:.4f}")
 
     print("[MoCap] === CALIBRATION ===")
 
@@ -215,20 +259,50 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
     if not _is_calibrated:
         calibrate(landmarks)
 
+    # --- DEPTH & ROTATION from torso geometry ---
+    current_torso_size, current_shoulder_w, _ = _compute_torso_metrics(landmarks)
+
+    # Depth ratio: how much closer/farther than calibration
+    # Larger apparent size = closer = depth_ratio < 1
+    if current_torso_size > 1e-6 and _calib_torso_size > 1e-6:
+        depth_ratio = _calib_torso_size / current_torso_size
+    else:
+        depth_ratio = 1.0
+
+    # Body rotation from shoulder width foreshortening
+    # cos(θ) = (apparent_shoulder_w / calib_shoulder_w) * depth_ratio
+    # When rotated, shoulders appear narrower; depth_ratio corrects for distance changes
+    if _calib_shoulder_width > 1e-6:
+        cos_theta = min(1.0, (current_shoulder_w / _calib_shoulder_width) * depth_ratio)
+        # Determine rotation sign from shoulder depth difference
+        # In our coords, deeper shoulder has more negative Y (by = lm.z)
+        l_shoulder_depth = landmarks[11]["z"]
+        r_shoulder_depth = landmarks[12]["z"]
+        rotation_sign = 1.0 if l_shoulder_depth < r_shoulder_depth else -1.0
+        body_rotation = rotation_sign * math.acos(max(0.0, cos_theta))
+    else:
+        body_rotation = 0.0
+
+    # Also compute body rotation from shoulder/hip line in XZ plane
+    shoulder_vec = (coords[12] - coords[11]).normalized()
+    hip_vec = (coords[24] - coords[23]).normalized()
+    avg_angle = (math.atan2(shoulder_vec.y, shoulder_vec.x) +
+                 math.atan2(hip_vec.y, hip_vec.x)) / 2
+    line_rotation = avg_angle - _calib_body_angle
+
+    # Blend: use trig rotation for large turns, line angle for small adjustments
+    if abs(body_rotation) > math.radians(10):
+        final_rotation = body_rotation
+    elif abs(line_rotation) > math.radians(5):
+        final_rotation = line_rotation
+    else:
+        final_rotation = 0.0
+
     # --- TORSO ROTATION ---
     if TORSO_BONE in armature.pose.bones:
         pb = armature.pose.bones[TORSO_BONE]
-        # Average shoulder and hip lines for more stable body rotation
-        shoulder_vec = (coords[12] - coords[11]).normalized()
-        hip_vec = (coords[24] - coords[23]).normalized()
-        avg_angle = (math.atan2(shoulder_vec.y, shoulder_vec.x) +
-                     math.atan2(hip_vec.y, hip_vec.x)) / 2
-        delta_angle = avg_angle - _calib_body_angle
-        # Dead zone: ignore tiny rotations (< 5 degrees) to prevent leg crosstalk
-        if abs(delta_angle) < math.radians(5):
-            delta_angle = 0.0
         pb.rotation_mode = "QUATERNION"
-        pb.rotation_quaternion = Quaternion(Vector((0, 0, 1)), -delta_angle)
+        pb.rotation_quaternion = Quaternion(Vector((0, 0, 1)), -final_rotation)
 
     # --- CHEST ---
     if CHEST_BONE in _bone_cache and CHEST_BONE in _calib_rotations:
@@ -289,12 +363,19 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
         pb.rotation_mode = "QUATERNION"
         pb.rotation_quaternion = delta
 
-    # Root position: hip midpoint for XY (walking), lowest foot for Z (jumping)
+    # Root position:
+    # X: hip midpoint X (lateral movement from image plane — reliable)
+    # Y: computed from torso size ratio (depth — trigonometric, much more accurate than MediaPipe Z)
+    # Z: lowest foot Z (vertical/jumping)
     hip_mid = (coords[23] + coords[24]) / 2
     lowest_foot_z = min(coords[27].z, coords[28].z)
 
+    # Depth from torso size: depth_ratio > 1 means farther (more negative Y)
+    # Scale factor converts the ratio to Blender units
+    computed_depth_y = -(depth_ratio - 1.0)  # 0 at calibration, negative when farther
+
     return {
-        "_root_xy": (hip_mid.x, hip_mid.y),
+        "_root_xy": (hip_mid.x, computed_depth_y),
         "_root_z": lowest_foot_z,
     }
 
