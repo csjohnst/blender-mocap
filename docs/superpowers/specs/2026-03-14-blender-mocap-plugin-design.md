@@ -2,6 +2,7 @@
 
 **Date:** 2026-03-14
 **Target:** Blender 4.5 LTS on Arch Linux
+**Platform scope:** Linux only (no Windows/macOS support planned)
 **Status:** Approved
 
 ## Overview
@@ -27,13 +28,20 @@ Two-process architecture for isolation and performance:
 
 ### IPC Protocol
 
-- **Transport:** Unix socket at `/tmp/blender-mocap-{pid}.sock`
-- **Format:** JSON, one message per line
-- **Messages:**
+- **Transport:** Unix socket at `/tmp/blender-mocap-{blender_pid}.sock` (uses Blender's PID for uniqueness). On startup, the subprocess manager removes any stale socket file at that path before binding.
+- **Format:** JSON, one message per line (newline-delimited)
+- **Handshake:** On connection, the server sends `{"type": "hello", "protocol_version": 1}`. The client checks the version and disconnects with an error if it doesn't match.
+- **Server → Client messages:**
   - `{"type": "pose", "landmarks": [...], "timestamp": float}` — 33 MediaPipe landmarks, each with x, y, z, visibility
   - `{"type": "status", "state": "ready|capturing|error", "message": str}` — status updates
   - `{"type": "error", "message": str}` — error reporting
-- **Direction:** Capture server → Blender addon (unidirectional data flow). Blender sends control commands (start/stop) via subprocess signals.
+- **Client → Server messages:**
+  - `{"type": "command", "action": "start_preview"}` — begin camera capture and pose estimation
+  - `{"type": "command", "action": "stop_preview"}` — stop capture, close preview window
+  - `{"type": "command", "action": "shutdown"}` — terminate the capture process cleanly
+- **Direction:** Bidirectional. Data flows server→client, commands flow client→server. The addon sends `shutdown` on Stop or when Blender closes; the subprocess also exits if the socket disconnects (Blender crash cleanup).
+- **Backpressure:** When the Blender timer drains the socket, it reads all available messages and discards all but the most recent pose. This ensures the addon always uses the freshest data and doesn't fall behind.
+- **Liveness:** The capture server sends `{"type": "heartbeat"}` every 2 seconds when idle (no pose data flowing). The Blender addon considers the server dead if no message of any type is received for 5 seconds, at which point it cleans up and shows an error. The capture server detects Blender disconnect by a broken pipe or empty read on the socket and exits.
 
 ## Rigify Bone Mapping
 
@@ -49,9 +57,29 @@ MediaPipe Pose produces 33 landmarks. These map to Rigify bones as follows:
 | 24 → 26 → 28 | thigh.R, shin.R, foot.R | Joint chain rotation |
 | 0 (nose), 7, 8 (ears) | spine.004–.006 (neck/head) | Head orientation |
 
+**Out of scope:** Finger tracking, toe orientation (landmarks 29–32), and shoulder roll are not mapped in this version. Full body only — no hands or face.
+
+### Coordinate System Transform
+
+MediaPipe outputs landmarks in normalized image coordinates:
+- X: 0.0 (left) to 1.0 (right)
+- Y: 0.0 (top) to 1.0 (bottom)
+- Z: depth relative to hip midpoint (negative = closer to camera)
+
+Blender uses a right-handed coordinate system (X-right, Y-forward, Z-up). The transform:
+- Blender X = MediaPipe X (scaled and centered)
+- Blender Y = -MediaPipe Z (depth becomes forward/back)
+- Blender Z = -MediaPipe Y (flip vertical, Y-up becomes Z-up)
+
 ### Rotation Calculation
 
-For each bone chain: compute the vector between parent and child landmarks, convert to a quaternion rotation relative to the bone's rest pose. Applied as pose bone rotations.
+For each bone chain:
+1. Compute the direction vector between parent and child landmarks in Blender space
+2. Get the bone's rest-pose direction vector from `bone.vector` (bone-local space)
+3. Compute the rotation quaternion that transforms the rest vector to the target vector
+4. Apply as `pose_bone.rotation_quaternion` in bone-local space (rotation mode set to QUATERNION)
+
+All rotations are applied in bone-local space, which means each bone rotates relative to its parent — matching how Rigify expects pose data.
 
 ### Depth
 
@@ -72,7 +100,7 @@ MediaPipe provides Z-depth per landmark relative to the hip midpoint. This gives
 - Poses continue to be applied live during recording
 - User clicks Stop — buffer is baked into a Blender Action:
   - Raw landmarks converted to bone rotations
-  - Keyframes inserted at appropriate frames (camera FPS mapped to scene FPS)
+  - Keyframes inserted with FPS resampling: timestamps are converted to scene frames using `frame = timestamp * scene_fps`. If camera FPS differs from scene FPS, landmark data is linearly interpolated to align with scene frame boundaries. Linear interpolation is acceptable for the initial version; the post-capture F-curve smoothing pass addresses any resulting stiffness.
   - Action auto-named `MoCap_001`, `MoCap_002`, etc.
 
 ### Post-Processing
@@ -89,6 +117,8 @@ One-euro filter applied to landmarks before sending to Blender. This is an adapt
 - Preserves sharp movements (low smoothing)
 - Industry standard for real-time motion data
 
+The UI exposes a single "Smoothing" slider (0.0–1.0). This maps to the one-euro filter's `min_cutoff` parameter: slider 0.0 = min_cutoff 1.0 (no smoothing), slider 1.0 = min_cutoff 0.05 (heavy smoothing). The `beta` (speed coefficient) is fixed at 0.5, which provides good responsiveness for human motion.
+
 ### Post-Capture (Blender Addon)
 
 Blender's built-in F-curve smooth operator applied to baked keyframes. User-adjustable strength.
@@ -97,7 +127,7 @@ Blender's built-in F-curve smooth operator applied to baked keyframes. User-adju
 
 Three export formats:
 
-1. **`.blend` Action** — saves the Action data block. Can be appended/linked into other Blender projects via File → Append.
+1. **`.blend` Action** — uses `bpy.data.libraries.write()` to save the Action data block to an external `.blend` file. Can be appended/linked into other Blender projects via File → Append.
 2. **FBX** — industry-standard exchange format. Exports armature + action.
 3. **BVH** — motion capture standard. Exports skeletal animation data only.
 
@@ -109,7 +139,7 @@ Sidebar panel in 3D Viewport N-panel, category "Motion Capture". Four collapsibl
 
 ### Setup
 - Camera dropdown — auto-detects `/dev/video*` devices
-- Target Armature — object picker (filtered to Rigify armatures)
+- Target Armature — object picker filtered to armatures that have a `rig_id` custom property (set by Rigify's Generate Rig operator)
 - Smoothing slider — real-time filter strength (0.0–1.0)
 
 ### Capture
@@ -173,11 +203,19 @@ blender-mocap/
 1. User installs addon .zip via Edit → Preferences → Add-ons → Install
 2. On first enable, addon checks for venv at `~/.blender-mocap/venv/`
 3. If missing, creates venv using system `python3` and installs `capture_server/requirements.txt`
+
+**Subprocess launch command:** The addon launches the capture server as:
+```
+~/.blender-mocap/venv/bin/python -m blender_mocap.capture_server --socket /tmp/blender-mocap-{pid}.sock --camera {device_index}
+```
+The `capture_server/` directory is located via `os.path.dirname(__file__)` from the addon, and its parent is added to `PYTHONPATH` for the subprocess.
+
+**Venv upgrades:** The addon writes a version marker file (`~/.blender-mocap/venv/.addon-version`) containing the addon version string. On enable, if the marker doesn't match the current addon version, the venv is recreated.
 4. Panel appears in 3D Viewport N-sidebar
 
 ### Requirements
 - Blender 4.5 LTS
-- System Python 3 (pre-installed on Arch Linux)
+- System Python 3.10–3.12 (required by MediaPipe). On first run, the addon checks `python3 --version` and shows an error if the version is outside this range.
 - Webcam accessible at `/dev/video*`
 
 ## Error Handling
@@ -187,3 +225,5 @@ blender-mocap/
 - **Capture process crashes:** Addon detects socket disconnect, shows error in status, cleans up
 - **No armature selected:** Record disabled, prompt to select Rigify armature
 - **MediaPipe fails to detect pose:** Preview continues, armature holds last known pose
+- **No recording selected on export:** Export buttons disabled when no recording is selected
+- **Addon unregister/Blender close:** `unregister()` sends shutdown command to capture server and reaps the subprocess. If subprocess doesn't exit within 3 seconds, it is killed via SIGKILL.
