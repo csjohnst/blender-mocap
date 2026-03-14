@@ -53,10 +53,13 @@ class IPCServer:
 
     def _read_commands_loop(self) -> None:
         while self._running and self._client_sock:
+            sock = self._client_sock
+            if sock is None:
+                break
             try:
-                ready, _, _ = select.select([self._client_sock], [], [], 0.5)
+                ready, _, _ = select.select([sock], [], [], 0.5)
                 if ready:
-                    data = self._client_sock.recv(4096)
+                    data = sock.recv(4096)
                     if not data:
                         break  # Client disconnected
                     self._recv_buffer += data.decode("utf-8")
@@ -65,7 +68,7 @@ class IPCServer:
                         if line.strip():
                             msg = json.loads(line)
                             self._command_queue.put(msg)
-            except (OSError, ConnectionError):
+            except (OSError, ConnectionError, AttributeError):
                 break
 
     def _raw_send(self, msg: dict) -> None:

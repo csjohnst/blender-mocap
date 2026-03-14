@@ -8,18 +8,22 @@ bl_info = {
     "category": "Animation",
 }
 
-from . import properties
-from . import operators
-from . import panels
+try:
+    import bpy
+    _HAS_BPY = True
+except ImportError:
+    _HAS_BPY = False
 
 
 def register():
+    from . import properties, operators, panels
     properties.register()
     operators.register()
     panels.register()
 
 
 def unregister():
+    from . import properties, operators, panels
     panels.unregister()
     operators.unregister()
     properties.unregister()
