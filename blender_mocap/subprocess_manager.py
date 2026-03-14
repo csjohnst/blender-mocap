@@ -128,6 +128,30 @@ class CaptureProcess:
     def is_running(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
+    def get_stderr(self) -> str:
+        """Read any available stderr from the subprocess (non-blocking).
+
+        Useful for diagnosing why the capture server crashed.
+        """
+        if self._process is None or self._process.stderr is None:
+            return ""
+        # If process has exited, read all remaining stderr
+        if self._process.poll() is not None:
+            try:
+                return self._process.stderr.read().decode("utf-8", errors="replace")
+            except (OSError, ValueError):
+                return ""
+        # Process still running — try non-blocking read
+        import select
+        try:
+            ready, _, _ = select.select([self._process.stderr], [], [], 0)
+            if ready:
+                data = self._process.stderr.read1(4096)
+                return data.decode("utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
+        return ""
+
     def stop(self, timeout: float = 3.0) -> None:
         """Stop the capture server gracefully, then force kill if needed."""
         if self._process is None:

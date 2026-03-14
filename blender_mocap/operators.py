@@ -75,7 +75,10 @@ class MOCAP_OT_start_preview(Operator):
         except OSError:
             hello = None
         if hello is None:
-            self.report({"ERROR"}, "Capture server failed to start — check that OpenCV and MediaPipe are installed")
+            stderr = _capture_process.get_stderr()
+            error_detail = stderr.strip().splitlines()[-1] if stderr.strip() else "unknown error"
+            self.report({"ERROR"}, f"Capture server failed to start: {error_detail}")
+            print(f"[MoCap] Capture server stderr:\n{stderr}")  # Full trace to console
             _ipc_client.close()
             _capture_process.stop()
             return {"CANCELLED"}
@@ -344,7 +347,13 @@ def _poll_poses() -> float | None:
     # Check liveness
     now = time.time()
     if now - _last_message_time > 5.0:
-        props.status = "Error: Server not responding"
+        stderr = _capture_process.get_stderr()
+        if stderr.strip():
+            error_detail = stderr.strip().splitlines()[-1]
+            props.status = f"Error: {error_detail}"
+            print(f"[MoCap] Capture server stderr:\n{stderr}")
+        else:
+            props.status = "Error: Server not responding"
         props.is_previewing = False
         _ipc_client.close()
         _capture_process.stop()
