@@ -31,7 +31,10 @@ class IPCClient:
                     return json.loads(line)
             ready, _, _ = select.select([self._sock], [], [], min(deadline, 0.5))
             if ready:
-                data = self._sock.recv(8192)
+                try:
+                    data = self._sock.recv(8192)
+                except OSError:
+                    return None  # Server disconnected or crashed
                 if not data:
                     return None  # Server disconnected
                 self._buffer += data.decode("utf-8")
@@ -50,7 +53,10 @@ class IPCClient:
             ready, _, _ = select.select([self._sock], [], [], 0)
             if not ready:
                 break
-            data = self._sock.recv(65536)
+            try:
+                data = self._sock.recv(65536)
+            except OSError:
+                break
             if not data:
                 break
             self._buffer += data.decode("utf-8")

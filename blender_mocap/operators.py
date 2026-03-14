@@ -70,8 +70,16 @@ class MOCAP_OT_start_preview(Operator):
         _ipc_client = client
 
         # Read handshake
-        hello = _ipc_client.read_message(timeout=5.0)
-        if not hello or hello.get("protocol_version") != 1:
+        try:
+            hello = _ipc_client.read_message(timeout=5.0)
+        except OSError:
+            hello = None
+        if hello is None:
+            self.report({"ERROR"}, "Capture server failed to start — check that OpenCV and MediaPipe are installed")
+            _ipc_client.close()
+            _capture_process.stop()
+            return {"CANCELLED"}
+        if hello.get("protocol_version") != 1:
             self.report({"ERROR"}, "Protocol version mismatch")
             _ipc_client.close()
             _capture_process.stop()
