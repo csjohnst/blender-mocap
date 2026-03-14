@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.superpowers/
+*.blend1
+*.blend2
+.venv/
+venv/
