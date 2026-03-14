@@ -8,9 +8,16 @@ from .ipc_client import IPCClient
 from .subprocess_manager import CaptureProcess, get_recordings_path
 from .recording import FrameBuffer, bake_to_action, next_action_name
 from .rigify_mapper import (
-    apply_pose_to_armature, compute_limb_rotations, reset_debug_counter,
-    calibrate, clear_calibration,
+    apply_pose_to_armature, compute_limb_rotations,
+    calibrate, clear_calibration, is_calibrated,
+    store_latest_landmarks, get_latest_landmarks,
+    clear_bone_cache, _ensure_bone_cache,
 )
+
+
+def _ensure_bone_cache_from_armature(armature):
+    """Ensure bone cache is populated for calibration."""
+    _ensure_bone_cache(armature)
 from .export import export_blend_action, export_fbx, export_bvh, copy_audio_file
 
 # Global state (persists across operator invocations)
@@ -19,9 +26,8 @@ _ipc_client: IPCClient | None = None
 _frame_buffer = FrameBuffer()
 _last_message_time = 0.0
 _bone_rest_vectors: dict = {}
-_initial_root_position: tuple | None = None  # First frame hip position for delta tracking
-_root_scale: float = 5.0  # Scale factor: MediaPipe normalized coords -> Blender units
-_latest_landmarks: list | None = None  # Most recent landmarks for calibration
+_initial_root_position: tuple | None = None
+_root_scale: float = 5.0
 
 
 def _get_bone_rest_vectors(armature) -> dict:
@@ -40,13 +46,28 @@ def _get_bone_rest_vectors(armature) -> dict:
 def _switch_to_fk(armature) -> None:
     """Switch all Rigify limbs to FK mode so we can set rotations directly."""
     from .rigify_mapper import IK_FK_SWITCH_BONES
+    print("[MoCap] === FK SWITCH ===")
     for ik_bone_name in IK_FK_SWITCH_BONES:
         if ik_bone_name in armature.pose.bones:
             pb = armature.pose.bones[ik_bone_name]
-            # Rigify stores IK/FK blend as a custom property
-            # 0.0 = IK, 1.0 = FK
             if "IK_FK" in pb:
                 pb["IK_FK"] = 1.0
+                print(f"  {ik_bone_name}: IK_FK set to 1.0 (FK mode)")
+            else:
+                # Try to find any IK/FK property
+                found = False
+                for key in pb.keys():
+                    if key.startswith("_"):
+                        continue
+                    if "ik" in key.lower() or "fk" in key.lower():
+                        print(f"  {ik_bone_name}: found property '{key}' = {pb[key]}")
+                        pb[key] = 1.0
+                        found = True
+                if not found:
+                    print(f"  WARNING: {ik_bone_name} has no IK_FK property! Custom props: {list(pb.keys())}")
+        else:
+            print(f"  WARNING: {ik_bone_name} not found! Available bones with 'parent': "
+                  f"{[b.name for b in armature.pose.bones if 'parent' in b.name]}")
 
 
 class MOCAP_OT_start_preview(Operator):
@@ -144,10 +165,10 @@ class MOCAP_OT_start_preview(Operator):
         _ipc_client.send_command("start_preview")
         _last_message_time = time.time()
 
-        # Switch Rigify limbs to FK mode, reset calibration and debug
+        # Switch Rigify limbs to FK mode, reset calibration
         _switch_to_fk(props.target_armature)
         clear_calibration()
-        reset_debug_counter()
+        clear_bone_cache()
         _bone_rest_vectors = _get_bone_rest_vectors(props.target_armature)
         global _initial_root_position
         _initial_root_position = None  # Reset — will be set from first pose frame
@@ -478,8 +499,7 @@ def _poll_poses() -> float | None:
     timestamp = pose["timestamp"]
 
     # Store for calibration
-    global _latest_landmarks
-    _latest_landmarks = landmarks
+    store_latest_landmarks(landmarks)
 
     # Buffer if recording
     if props.is_recording:
@@ -532,8 +552,11 @@ class MOCAP_OT_reset_pose(Operator):
         reset_debug_counter()
 
         # Calibrate using latest landmarks if preview is active
-        if _latest_landmarks is not None:
-            calibrate(_latest_landmarks)
+        latest = get_latest_landmarks()
+        if latest is not None:
+            clear_bone_cache()
+            _ensure_bone_cache_from_armature(armature)
+            calibrate(latest)
             self.report({"INFO"}, "Calibrated — your current pose is now the reference")
         else:
             clear_calibration()

@@ -1,41 +1,14 @@
 # blender_mocap/rigify_mapper.py
 """Maps MediaPipe pose landmarks to Rigify armature bone rotations.
 
-Uses a calibration-relative approach:
-1. User stands in A-pose and clicks "Calibrate"
-2. The landmark directions in that pose become the reference
-3. All subsequent rotations are the DIFFERENCE between current and reference
-4. When the user matches their calibration pose, the model is at rest
-
-This eliminates offset errors from the person's natural pose not matching
-the Rigify rest pose.
+SIMPLE APPROACH:
+For each bone, compute an "absolute" rotation from rest to target using
+the bone's rest_local matrix. Store the calibration-frame absolute rotation.
+At each frame: rotation_quaternion = calib_absolute^-1 @ current_absolute.
+This gives identity at calibration and the correct delta for movement.
 """
 import math
 
-_debug_frame_count = 0
-_DEBUG_FRAMES = 3
-
-# Calibration data: stores bone directions from the calibration frame
-_calibration_dirs = {}  # bone_name -> Vector direction in blender coords
-_calibration_body_angle = 0.0  # shoulder line angle at calibration
-_is_calibrated = False
-
-
-def mediapipe_to_blender_coords(lm: dict) -> tuple[float, float, float]:
-    """Convert a MediaPipe landmark to Blender world coordinates.
-
-    MediaPipe: X right [0,1], Y down [0,1], Z depth (neg=closer).
-    Blender: X right, Y forward, Z up.
-
-    The character faces -Y (toward camera), so closer to camera = -Y.
-    """
-    bx = lm["x"] - 0.5
-    by = lm["z"]              # depth: neg=closer to camera = -Y (forward for character)
-    bz = -(lm["y"] - 0.5)    # flip Y: 0=top -> positive Z
-    return bx, by, bz
-
-
-# Rigify FK bone map: bone_name -> landmark indices
 RIGIFY_BONE_MAP = {
     "upper_arm_fk.L": {"parent_idx": 11, "child_idx": 13},
     "forearm_fk.L":   {"parent_idx": 13, "child_idx": 15},
@@ -51,15 +24,6 @@ RIGIFY_BONE_MAP = {
     "foot_fk.R":      {"indices": [30, 32], "type": "foot"},
 }
 
-CHAIN_ORDER = [
-    "upper_arm_fk.L", "upper_arm_fk.R",
-    "thigh_fk.L", "thigh_fk.R",
-    "forearm_fk.L", "forearm_fk.R",
-    "shin_fk.L", "shin_fk.R",
-    "hand_fk.L", "hand_fk.R",
-    "foot_fk.L", "foot_fk.R",
-]
-
 IK_FK_SWITCH_BONES = [
     "upper_arm_parent.L",
     "upper_arm_parent.R",
@@ -71,37 +35,87 @@ CHEST_BONE = "chest"
 HEAD_BONE = "head"
 TORSO_BONE = "torso"
 
+# Calibration state
+_calib_rotations = {}  # bone_name -> Quaternion (absolute rotation at calibration)
+_calib_body_angle = 0.0
+_is_calibrated = False
+_latest_landmarks = None
 
-def calibrate(landmarks: list[dict]) -> None:
-    """Store the current pose as calibration reference (A-pose).
 
-    After calibration, all rotations are computed as the difference
-    between the current frame and this reference frame.
+def mediapipe_to_blender_coords(lm: dict) -> tuple[float, float, float]:
+    bx = lm["x"] - 0.5
+    by = lm["z"]              # closer to camera = -Y (character faces -Y)
+    bz = -(lm["y"] - 0.5)    # top of image = +Z
+    return bx, by, bz
+
+
+def _get_target_dir(coords, mapping):
+    """Get target direction from landmark coordinates."""
+    from mathutils import Vector
+    if mapping.get("type") == "foot":
+        heel_idx, toe_idx = mapping["indices"]
+        return (coords[toe_idx] - coords[heel_idx]).normalized()
+    else:
+        return (coords[mapping["child_idx"]] - coords[mapping["parent_idx"]]).normalized()
+
+
+def _compute_absolute_rotation(rest_bone, target_dir):
+    """Compute the absolute rotation for a bone to point at target_dir.
+
+    Returns a Quaternion that would make the bone point from its rest
+    direction to target_dir. Computed in the bone's rest_local space.
     """
     from mathutils import Vector
 
-    global _calibration_dirs, _calibration_body_angle, _is_calibrated
+    # rest_local: the bone's rest matrix relative to its parent
+    if rest_bone.parent:
+        rest_local = rest_bone.parent.matrix_local.inverted() @ rest_bone.matrix_local
+    else:
+        rest_local = rest_bone.matrix_local
+
+    # Convert target direction into the bone's rest_local frame
+    local_target = (rest_local.to_3x3().inverted() @ target_dir).normalized()
+
+    # In rest_local frame, the bone points along Y
+    local_rest = Vector((0, 1, 0))
+
+    # Rotation from rest to target in the bone's local frame
+    return local_rest.rotation_difference(local_target)
+
+
+def calibrate(landmarks: list[dict]) -> None:
+    """Store the current pose as calibration reference."""
+    from mathutils import Vector
+    global _calib_rotations, _calib_body_angle, _is_calibrated
 
     coords = [Vector(mediapipe_to_blender_coords(lm)) for lm in landmarks]
+    _calib_rotations = {}
 
-    # Store bone directions at calibration
-    _calibration_dirs = {}
-    for bone_name, mapping in RIGIFY_BONE_MAP.items():
-        if mapping.get("type") == "foot":
-            heel_idx, toe_idx = mapping["indices"]
-            direction = (coords[toe_idx] - coords[heel_idx]).normalized()
-        else:
-            parent_pos = coords[mapping["parent_idx"]]
-            child_pos = coords[mapping["child_idx"]]
-            direction = (child_pos - parent_pos).normalized()
-        _calibration_dirs[bone_name] = direction
+    print("[MoCap] === CALIBRATION ===")
 
-    # Store spine direction
+    # Calibrate limb bones
+    for bone_name in _bone_cache:
+        if bone_name not in RIGIFY_BONE_MAP:
+            continue
+        mapping = RIGIFY_BONE_MAP[bone_name]
+        rest_bone = _bone_cache[bone_name]
+        target_dir = _get_target_dir(coords, mapping)
+        if target_dir.length < 1e-6:
+            continue
+        abs_rot = _compute_absolute_rotation(rest_bone, target_dir)
+        _calib_rotations[bone_name] = abs_rot
+        print(f"  {bone_name}: target={target_dir:.3f} abs_rot={abs_rot:.3f}")
+
+    # Calibrate spine
     mid_hip = (coords[23] + coords[24]) / 2
     mid_shoulder = (coords[11] + coords[12]) / 2
-    _calibration_dirs["_spine"] = (mid_shoulder - mid_hip).normalized()
+    spine_dir = (mid_shoulder - mid_hip).normalized()
+    if CHEST_BONE in _bone_cache and spine_dir.length > 1e-6:
+        abs_rot = _compute_absolute_rotation(_bone_cache[CHEST_BONE], spine_dir)
+        _calib_rotations[CHEST_BONE] = abs_rot
+        print(f"  {CHEST_BONE}: target={spine_dir:.3f}")
 
-    # Store head up direction
+    # Calibrate head
     l_ear, r_ear, nose = coords[7], coords[8], coords[0]
     ear_mid = (l_ear + r_ear) / 2
     face_right = (r_ear - l_ear).normalized()
@@ -109,14 +123,18 @@ def calibrate(landmarks: list[dict]) -> None:
     face_up = face_right.cross(face_forward).normalized()
     if face_up.z < 0:
         face_up = -face_up
-    _calibration_dirs["_head"] = face_up
+    if HEAD_BONE in _bone_cache and face_up.length > 1e-6:
+        abs_rot = _compute_absolute_rotation(_bone_cache[HEAD_BONE], face_up)
+        _calib_rotations[HEAD_BONE] = abs_rot
+        print(f"  {HEAD_BONE}: face_up={face_up:.3f}")
 
-    # Store body angle
+    # Calibrate body angle
     shoulder_vec = (coords[12] - coords[11]).normalized()
-    _calibration_body_angle = math.atan2(shoulder_vec.y, shoulder_vec.x)
+    _calib_body_angle = math.atan2(shoulder_vec.y, shoulder_vec.x)
+    print(f"  body_angle: {math.degrees(_calib_body_angle):.1f}°")
 
     _is_calibrated = True
-    print(f"[MoCap] Calibrated with {len(_calibration_dirs)} bone directions")
+    print(f"[MoCap] Calibrated {len(_calib_rotations)} bones")
 
 
 def is_calibrated() -> bool:
@@ -128,148 +146,127 @@ def clear_calibration() -> None:
     _is_calibrated = False
 
 
+def store_latest_landmarks(landmarks):
+    global _latest_landmarks
+    _latest_landmarks = landmarks
+
+
+def get_latest_landmarks():
+    return _latest_landmarks
+
+
+# Cache of bone rest data (populated on first apply)
+_bone_cache = {}  # bone_name -> rest bone
+
+
+def _ensure_bone_cache(armature):
+    """Cache bone rest data from armature."""
+    global _bone_cache
+    if _bone_cache:
+        return
+
+    all_bones = list(RIGIFY_BONE_MAP.keys()) + [CHEST_BONE, HEAD_BONE]
+    for bone_name in all_bones:
+        if bone_name in armature.data.bones:
+            _bone_cache[bone_name] = armature.data.bones[bone_name]
+
+    print(f"[MoCap] Bone cache: {len(_bone_cache)} bones found")
+    for name in all_bones:
+        if name not in _bone_cache:
+            print(f"[MoCap] WARNING: bone '{name}' not found in armature!")
+        else:
+            bone = _bone_cache[name]
+            print(f"[MoCap]   {name}: vector={bone.vector.normalized():.3f} parent={bone.parent.name if bone.parent else 'None'}")
+
+
+def clear_bone_cache():
+    global _bone_cache
+    _bone_cache = {}
+
+
 def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
-    """Apply MediaPipe landmarks to a Rigify armature.
+    """Apply MediaPipe landmarks to a Rigify armature."""
+    from mathutils import Vector, Quaternion
 
-    If calibrated, rotations are relative to the calibration pose.
-    If not calibrated, auto-calibrates on first frame.
-    """
-    from mathutils import Vector, Matrix, Quaternion
-
-    global _debug_frame_count, _is_calibrated
-    debug = _debug_frame_count < _DEBUG_FRAMES
-    _debug_frame_count += 1
+    _ensure_bone_cache(armature)
 
     coords = [Vector(mediapipe_to_blender_coords(lm)) for lm in landmarks]
 
-    # Auto-calibrate on first frame if not already calibrated
+    # Auto-calibrate on first frame
     if not _is_calibrated:
         calibrate(landmarks)
 
-    if debug:
-        print(f"\n[MoCap DEBUG] Frame {_debug_frame_count}")
-        print(f"  Calibrated: {_is_calibrated}")
-        print(f"  Hip L (23): {coords[23]:.3f}")
-        print(f"  Knee L (25): {coords[25]:.3f}")
-        print(f"  Shoulder L (11): {coords[11]:.3f}")
-
-    # --- TORSO ROTATION (relative to calibration) ---
+    # --- TORSO ROTATION ---
     if TORSO_BONE in armature.pose.bones:
         pb = armature.pose.bones[TORSO_BONE]
         shoulder_vec = (coords[12] - coords[11]).normalized()
         current_angle = math.atan2(shoulder_vec.y, shoulder_vec.x)
-        # Rotation relative to calibration
-        delta_angle = current_angle - _calibration_body_angle
-        yaw_quat = Quaternion(Vector((0, 0, 1)), -delta_angle)
+        delta_angle = current_angle - _calib_body_angle
         pb.rotation_mode = "QUATERNION"
-        pb.rotation_quaternion = yaw_quat
+        pb.rotation_quaternion = Quaternion(Vector((0, 0, 1)), -delta_angle)
 
-        if debug:
-            print(f"  [torso] delta_angle: {math.degrees(delta_angle):.1f}°")
-
-    # --- CHEST (spine tilt, relative to calibration) ---
-    if CHEST_BONE in armature.pose.bones and "_spine" in _calibration_dirs:
+    # --- CHEST ---
+    if CHEST_BONE in _bone_cache and CHEST_BONE in _calib_rotations:
         pb = armature.pose.bones[CHEST_BONE]
-        rest_bone = pb.bone
-
+        rest_bone = _bone_cache[CHEST_BONE]
         mid_hip = (coords[23] + coords[24]) / 2
         mid_shoulder = (coords[11] + coords[12]) / 2
-        current_spine = (mid_shoulder - mid_hip).normalized()
-        calib_spine = _calibration_dirs["_spine"]
+        spine_dir = (mid_shoulder - mid_hip).normalized()
+        if spine_dir.length > 1e-6:
+            current_abs = _compute_absolute_rotation(rest_bone, spine_dir)
+            calib_abs = _calib_rotations[CHEST_BONE]
+            delta = calib_abs.inverted() @ current_abs
+            pb.rotation_mode = "QUATERNION"
+            pb.rotation_quaternion = delta
 
-        # Rotation from calibration spine to current spine
-        delta_rot = calib_spine.rotation_difference(current_spine)
-        # Convert to bone-local
-        bone_orient = rest_bone.matrix_local.to_3x3()
-        local_rot = (bone_orient.inverted() @ delta_rot.to_matrix() @ bone_orient).to_quaternion()
-
-        pb.rotation_mode = "QUATERNION"
-        pb.rotation_quaternion = local_rot
-
-        if debug:
-            print(f"  [chest] calib: {calib_spine:.3f} curr: {current_spine:.3f}")
-
-    # --- HEAD (relative to calibration) ---
-    if HEAD_BONE in armature.pose.bones and "_head" in _calibration_dirs:
+    # --- HEAD ---
+    if HEAD_BONE in _bone_cache and HEAD_BONE in _calib_rotations:
         pb = armature.pose.bones[HEAD_BONE]
-        rest_bone = pb.bone
-
+        rest_bone = _bone_cache[HEAD_BONE]
         l_ear, r_ear, nose = coords[7], coords[8], coords[0]
         ear_mid = (l_ear + r_ear) / 2
         face_right = (r_ear - l_ear).normalized()
         face_forward = (nose - ear_mid).normalized()
-        current_up = face_right.cross(face_forward).normalized()
-        if current_up.z < 0:
-            current_up = -current_up
+        face_up = face_right.cross(face_forward).normalized()
+        if face_up.z < 0:
+            face_up = -face_up
+        if face_up.length > 1e-6:
+            current_abs = _compute_absolute_rotation(rest_bone, face_up)
+            calib_abs = _calib_rotations[HEAD_BONE]
+            delta = calib_abs.inverted() @ current_abs
+            pb.rotation_mode = "QUATERNION"
+            pb.rotation_quaternion = delta
 
-        calib_up = _calibration_dirs["_head"]
-        delta_rot = calib_up.rotation_difference(current_up)
-        bone_orient = rest_bone.matrix_local.to_3x3()
-        local_rot = (bone_orient.inverted() @ delta_rot.to_matrix() @ bone_orient).to_quaternion()
-
-        pb.rotation_mode = "QUATERNION"
-        pb.rotation_quaternion = local_rot
-
-        if debug:
-            print(f"  [head] calib_up: {calib_up:.3f} curr_up: {current_up:.3f}")
-
-    # --- LIMBS (relative to calibration, chain-aware) ---
-    posed_matrices = {}
-
-    for bone_name in CHAIN_ORDER:
+    # --- LIMBS ---
+    for bone_name, mapping in RIGIFY_BONE_MAP.items():
         if bone_name not in armature.pose.bones:
             continue
-        if bone_name not in _calibration_dirs:
+        if bone_name not in _bone_cache:
+            continue
+        if bone_name not in _calib_rotations:
             continue
 
-        mapping = RIGIFY_BONE_MAP[bone_name]
         pb = armature.pose.bones[bone_name]
-        rest_bone = pb.bone
+        rest_bone = _bone_cache[bone_name]
+        target_dir = _get_target_dir(coords, mapping)
 
-        # Current direction from landmarks
-        if mapping.get("type") == "foot":
-            heel_idx, toe_idx = mapping["indices"]
-            current_dir = (coords[toe_idx] - coords[heel_idx]).normalized()
-        else:
-            parent_pos = coords[mapping["parent_idx"]]
-            child_pos = coords[mapping["child_idx"]]
-            current_dir = (child_pos - parent_pos).normalized()
-
-        if current_dir.length < 1e-6:
+        if target_dir.length < 1e-6:
             continue
 
-        # Calibration direction for this bone
-        calib_dir = _calibration_dirs[bone_name]
-
-        # Delta rotation: from calibration direction to current direction
-        # This is the actual movement the person made since calibration
-        delta_rot = calib_dir.rotation_difference(current_dir)
-
-        # Convert armature-space delta rotation to bone-local
-        bone_orient = rest_bone.matrix_local.to_3x3()
-        local_rot = (bone_orient.inverted() @ delta_rot.to_matrix() @ bone_orient).to_quaternion()
+        current_abs = _compute_absolute_rotation(rest_bone, target_dir)
+        calib_abs = _calib_rotations[bone_name]
+        delta = calib_abs.inverted() @ current_abs
 
         pb.rotation_mode = "QUATERNION"
-        pb.rotation_quaternion = local_rot
-
-        if debug and bone_name in ("thigh_fk.L", "upper_arm_fk.L"):
-            print(f"  [{bone_name}] calib: {calib_dir:.3f} curr: {current_dir:.3f}")
-            print(f"  [{bone_name}] delta_rot: {delta_rot:.3f}")
-            print(f"  [{bone_name}] local_rot: {local_rot:.3f}")
+        pb.rotation_quaternion = delta
 
     # Root position
     hip_mid = (coords[23] + coords[24]) / 2
     return {"_root_position": (hip_mid.x, hip_mid.y, hip_mid.z)}
 
 
-def reset_debug_counter():
-    global _debug_frame_count
-    _debug_frame_count = 0
-
-
 # Legacy function for recording.py bake
 def compute_limb_rotations(landmarks, bone_rest_vectors):
-    """Compute rotations for baking."""
     coords = [mediapipe_to_blender_coords(lm) for lm in landmarks]
     rotations = {}
 
