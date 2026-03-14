@@ -55,9 +55,13 @@ MediaPipe Pose produces 33 landmarks. These map to Rigify bones as follows:
 | 12 → 14 → 16 | upper_arm.R, forearm.R, hand.R | Joint chain rotation |
 | 23 → 25 → 27 | thigh.L, shin.L, foot.L | Joint chain rotation |
 | 24 → 26 → 28 | thigh.R, shin.R, foot.R | Joint chain rotation |
+| 27, 29, 31 (ankle, heel, foot index) | foot.L | Foot orientation from heel→toe vector |
+| 28, 30, 32 (ankle, heel, foot index) | foot.R | Foot orientation from heel→toe vector |
 | 0 (nose), 7, 8 (ears) | spine.004–.006 (neck/head) | Head orientation |
 
-**Out of scope:** Finger tracking, toe orientation (landmarks 29–32), and shoulder roll are not mapped in this version. Full body only — no hands or face.
+**Foot/ankle orientation:** The foot bone rotation is derived from the heel-to-foot-index vector (landmarks 29→31 for left, 30→32 for right), giving natural toe direction during walking. The ankle pitch (dorsiflexion/plantarflexion) comes from the shin-to-ankle-to-toe angle. This prevents the "dangling feet" artifact common in basic pose-to-rig mappings.
+
+**Out of scope:** Finger tracking and shoulder roll are not mapped in this version. Full body only — no hands or face.
 
 ### Coordinate System Transform
 
