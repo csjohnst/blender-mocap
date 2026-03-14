@@ -1,12 +1,14 @@
 # blender_mocap/rigify_mapper.py
 """Maps MediaPipe pose landmarks to Rigify armature bone rotations.
 
-Uses pose_bone.matrix (armature-space) to set bone orientations directly.
-Blender internally decomposes this into the correct parent-relative
-rotation_quaternion, handling the bone chain hierarchy automatically.
+Processes bones in chain order (root→tip), tracking each bone's computed
+armature-space matrix so children correctly account for parent rotations.
 
-This avoids the error-prone manual bone-local rotation math that breaks
-on chains where child rotations compound with parent rotations.
+The key issue with naive approaches: Blender's pose_bone.matrix setter
+and rotation_quaternion are both relative to the parent's current state.
+Without a depsgraph update between parent and child, the parent's matrix
+is stale. We solve this by computing everything ourselves and only
+setting rotation_quaternion at the end.
 """
 
 
@@ -16,32 +18,39 @@ def mediapipe_to_blender_coords(lm: dict) -> tuple[float, float, float]:
     MediaPipe: X right [0,1], Y down [0,1], Z depth (neg=closer).
     Blender: X right, Y forward, Z up.
     """
-    bx = lm["x"] - 0.5       # Center: 0.5 -> 0.0
-    by = -lm["z"]             # Depth: neg closer -> positive forward
-    bz = -(lm["y"] - 0.5)    # Flip Y: 0=top -> positive Z
+    bx = lm["x"] - 0.5
+    by = -lm["z"]
+    bz = -(lm["y"] - 0.5)
     return bx, by, bz
 
 
-# Mapping: Rigify GENERATED rig FK control bone names -> MediaPipe landmark indices
+# Rigify FK bone map: bone_name -> landmark indices
 RIGIFY_BONE_MAP = {
-    # Arms (FK control bones)
     "upper_arm_fk.L": {"parent_idx": 11, "child_idx": 13},
     "forearm_fk.L":   {"parent_idx": 13, "child_idx": 15},
     "hand_fk.L":      {"parent_idx": 15, "child_idx": 19},
     "upper_arm_fk.R": {"parent_idx": 12, "child_idx": 14},
     "forearm_fk.R":   {"parent_idx": 14, "child_idx": 16},
     "hand_fk.R":      {"parent_idx": 16, "child_idx": 20},
-    # Legs (FK control bones)
     "thigh_fk.L":     {"parent_idx": 23, "child_idx": 25},
     "shin_fk.L":      {"parent_idx": 25, "child_idx": 27},
     "thigh_fk.R":     {"parent_idx": 24, "child_idx": 26},
     "shin_fk.R":      {"parent_idx": 26, "child_idx": 28},
-    # Feet (FK control bones) -- use heel-to-toe vector
     "foot_fk.L":      {"indices": [29, 31], "type": "foot"},
     "foot_fk.R":      {"indices": [30, 32], "type": "foot"},
 }
 
-# Bones that carry the IK_FK custom property (the limb parent/master bones)
+# Process order: root bones first, then children, then leaves
+# This ensures parent rotations are computed before children need them
+CHAIN_ORDER = [
+    "upper_arm_fk.L", "upper_arm_fk.R",
+    "thigh_fk.L", "thigh_fk.R",
+    "forearm_fk.L", "forearm_fk.R",
+    "shin_fk.L", "shin_fk.R",
+    "hand_fk.L", "hand_fk.R",
+    "foot_fk.L", "foot_fk.R",
+]
+
 IK_FK_SWITCH_BONES = [
     "upper_arm_parent.L",
     "upper_arm_parent.R",
@@ -49,7 +58,6 @@ IK_FK_SWITCH_BONES = [
     "thigh_parent.R",
 ]
 
-# Spine/head control bone names
 CHEST_BONE = "chest"
 HEAD_BONE = "head"
 TORSO_BONE = "torso"
@@ -58,8 +66,8 @@ TORSO_BONE = "torso"
 def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
     """Apply MediaPipe landmarks to a Rigify armature.
 
-    Sets each bone's armature-space matrix directly using pose_bone.matrix.
-    Blender handles decomposition into parent-relative rotation automatically.
+    Processes bones root→tip, tracking computed matrices so children
+    correctly account for parent rotations without needing depsgraph updates.
 
     Args:
         landmarks: 33 MediaPipe landmarks with x, y, z, visibility.
@@ -68,20 +76,24 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
     Returns:
         dict with "_root_position" for root motion tracking.
     """
-    from mathutils import Vector, Matrix
+    from mathutils import Vector, Matrix, Quaternion
 
     coords = [Vector(mediapipe_to_blender_coords(lm)) for lm in landmarks]
-    result = {}
 
-    # Apply limb rotations
-    for bone_name, mapping in RIGIFY_BONE_MAP.items():
+    # Track the armature-space matrix we've computed for each bone
+    # so children can reference the parent's NEW orientation
+    posed_matrices = {}
+
+    # Process limbs in chain order
+    for bone_name in CHAIN_ORDER:
         if bone_name not in armature.pose.bones:
             continue
 
+        mapping = RIGIFY_BONE_MAP[bone_name]
         pb = armature.pose.bones[bone_name]
         rest_bone = pb.bone
 
-        # Get target direction in armature space
+        # Compute target direction from landmarks (armature space)
         if mapping.get("type") == "foot":
             heel_idx, toe_idx = mapping["indices"]
             target_dir = (coords[toe_idx] - coords[heel_idx]).normalized()
@@ -93,68 +105,95 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
         if target_dir.length < 1e-6:
             continue
 
-        _set_bone_direction(pb, rest_bone, target_dir)
+        # Compute the effective parent matrix
+        # If we've already posed the parent bone, use our computed matrix
+        # Otherwise fall back to the rest pose
+        if rest_bone.parent and rest_bone.parent.name in posed_matrices:
+            parent_mat = posed_matrices[rest_bone.parent.name]
+        elif rest_bone.parent:
+            parent_mat = rest_bone.parent.matrix_local
+        else:
+            parent_mat = Matrix.Identity(4)
 
-    # Chest orientation from shoulders/hips
+        # Bone's rest transform relative to parent
+        rest_local = parent_mat.inverted() @ rest_bone.matrix_local
+
+        # The bone's effective armature-space matrix (before our rotation)
+        effective_mat = parent_mat @ rest_local  # = bone.matrix_local when parent at rest
+
+        # Convert target direction into the bone's local frame
+        local_target = (effective_mat.to_3x3().inverted() @ target_dir).normalized()
+
+        # Bone's rest direction in its local frame is always Y
+        local_rest = Vector((0, 1, 0))
+
+        # Compute the local rotation
+        local_rot = local_rest.rotation_difference(local_target)
+
+        # Apply
+        pb.rotation_mode = "QUATERNION"
+        pb.rotation_quaternion = local_rot
+
+        # Compute and store this bone's new armature-space matrix for children
+        rot_mat = local_rot.to_matrix().to_4x4()
+        posed_matrices[bone_name] = effective_mat @ rot_mat
+
+    # Chest/spine orientation
     if CHEST_BONE in armature.pose.bones:
         pb = armature.pose.bones[CHEST_BONE]
         rest_bone = pb.bone
+
         mid_hip = (coords[23] + coords[24]) / 2
         mid_shoulder = (coords[11] + coords[12]) / 2
-        spine_dir = (mid_shoulder - mid_hip).normalized()
-        if spine_dir.length > 1e-6:
-            _set_bone_direction(pb, rest_bone, spine_dir)
+        target_dir = (mid_shoulder - mid_hip).normalized()
 
-    # Head orientation from nose and ears
+        if target_dir.length > 1e-6:
+            _apply_rotation(pb, rest_bone, target_dir, posed_matrices)
+
+    # Head orientation
     if HEAD_BONE in armature.pose.bones:
         pb = armature.pose.bones[HEAD_BONE]
         rest_bone = pb.bone
+
         ear_mid = (coords[7] + coords[8]) / 2
-        head_dir = (coords[0] - ear_mid).normalized()
-        if head_dir.length > 1e-6:
-            _set_bone_direction(pb, rest_bone, head_dir)
+        target_dir = (coords[0] - ear_mid).normalized()
 
-    # Root position (hip midpoint) for world-space translation
+        if target_dir.length > 1e-6:
+            _apply_rotation(pb, rest_bone, target_dir, posed_matrices)
+
+    # Root position
     hip_mid = (coords[23] + coords[24]) / 2
-    result["_root_position"] = (hip_mid.x, hip_mid.y, hip_mid.z)
-
-    return result
+    return {"_root_position": (hip_mid.x, hip_mid.y, hip_mid.z)}
 
 
-def _set_bone_direction(pose_bone, rest_bone, target_dir):
-    """Set a bone to point in target_dir (armature space) while preserving roll.
-
-    Uses pose_bone.matrix to set the armature-space orientation directly.
-    Blender decomposes this into the correct parent-relative rotation.
-    """
+def _apply_rotation(pose_bone, rest_bone, target_dir, posed_matrices):
+    """Apply a rotation to make a bone point in target_dir, accounting for parent chain."""
     from mathutils import Vector, Matrix
 
-    # Bone's rest direction in armature space
-    rest_dir = rest_bone.vector.normalized()
+    if rest_bone.parent and rest_bone.parent.name in posed_matrices:
+        parent_mat = posed_matrices[rest_bone.parent.name]
+    elif rest_bone.parent:
+        parent_mat = rest_bone.parent.matrix_local
+    else:
+        parent_mat = Matrix.Identity(4)
 
-    # Rotation from rest direction to target direction
-    rot = rest_dir.rotation_difference(target_dir)
+    rest_local = parent_mat.inverted() @ rest_bone.matrix_local
+    effective_mat = parent_mat @ rest_local
 
-    # Apply rotation to the bone's rest matrix, keeping head position
-    rest_mat = rest_bone.matrix_local.copy()
-    head_pos = Vector(rest_bone.head_local)
+    local_target = (effective_mat.to_3x3().inverted() @ target_dir).normalized()
+    local_rest = Vector((0, 1, 0))
+    local_rot = local_rest.rotation_difference(local_target)
 
-    # Rotate the rest matrix around the bone's head position
-    new_mat = (
-        Matrix.Translation(head_pos)
-        @ rot.to_matrix().to_4x4()
-        @ Matrix.Translation(-head_pos)
-        @ rest_mat
-    )
+    pose_bone.rotation_mode = "QUATERNION"
+    pose_bone.rotation_quaternion = local_rot
 
-    # Set the pose bone's armature-space matrix
-    # Blender automatically decomposes this into parent-relative transforms
-    pose_bone.matrix = new_mat
+    rot_mat = local_rot.to_matrix().to_4x4()
+    posed_matrices[rest_bone.name] = effective_mat @ rot_mat
 
 
-# Keep compute_limb_rotations for backwards compat with recording.py bake
+# Legacy function for recording.py bake
 def compute_limb_rotations(landmarks, bone_rest_vectors):
-    """Legacy function for recording bake — returns rotation dict."""
+    """Compute rotations for baking — uses simplified world-space approach."""
     import math
 
     def _normalize(v):
@@ -176,7 +215,7 @@ def compute_limb_rotations(landmarks, bone_rest_vectors):
         if d > 0.9999:
             return (1, 0, 0, 0)
         if d < -0.9999:
-            perp = _normalize(_cross(rn, (1,0,0) if abs(rn[0])<0.9 else (0,1,0)))
+            perp = _normalize(_cross(rn, (1, 0, 0) if abs(rn[0]) < 0.9 else (0, 1, 0)))
             return (0, perp[0], perp[1], perp[2])
         axis = _normalize(_cross(rn, tn))
         ha = math.acos(d) / 2
@@ -199,5 +238,7 @@ def compute_limb_rotations(landmarks, bone_rest_vectors):
         rotations[bone_name] = _bone_rot(rest_vec, tv)
 
     l_hip, r_hip = coords[23], coords[24]
-    rotations["_root_position"] = ((l_hip[0]+r_hip[0])/2, (l_hip[1]+r_hip[1])/2, (l_hip[2]+r_hip[2])/2)
+    rotations["_root_position"] = (
+        (l_hip[0]+r_hip[0])/2, (l_hip[1]+r_hip[1])/2, (l_hip[2]+r_hip[2])/2
+    )
     return rotations
