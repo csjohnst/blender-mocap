@@ -8,10 +8,18 @@ bl_info = {
     "category": "Animation",
 }
 
+from . import properties
+from . import operators
+from . import panels
+
 
 def register():
-    pass
+    properties.register()
+    operators.register()
+    panels.register()
 
 
 def unregister():
-    pass
+    panels.unregister()
+    operators.unregister()
+    properties.unregister()
