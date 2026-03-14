@@ -56,6 +56,9 @@ _calib_torso_size = 0.0    # Average torso metric at calibration (for depth)
 _calib_shoulder_width = 0.0  # Shoulder width at calibration (for rotation)
 _is_calibrated = False
 _latest_landmarks = None
+_prev_rotations = {}   # bone_name -> Quaternion (previous frame, for smoothing)
+_smoothing_factor = 0.4  # 0 = no smoothing (instant), 1 = frozen. 0.4 = natural
+_max_angular_velocity = math.radians(120)  # Max degrees per frame (~30fps = 3600°/s)
 
 
 def _compute_torso_metrics(landmarks_raw: list[dict]) -> tuple[float, float, float]:
@@ -203,8 +206,45 @@ def is_calibrated() -> bool:
 
 
 def clear_calibration() -> None:
-    global _is_calibrated
+    global _is_calibrated, _prev_rotations
     _is_calibrated = False
+    _prev_rotations = {}
+
+
+def set_smoothing(value: float) -> None:
+    """Set rotation smoothing factor. 0 = instant, 1 = frozen."""
+    global _smoothing_factor
+    _smoothing_factor = max(0.0, min(0.95, value))
+
+
+def _smooth_rotation(bone_name, new_rot):
+    """Apply temporal smoothing and angular velocity clamping to a rotation.
+
+    Returns the smoothed quaternion.
+    """
+    from mathutils import Quaternion
+
+    if bone_name not in _prev_rotations:
+        _prev_rotations[bone_name] = new_rot.copy()
+        return new_rot
+
+    prev = _prev_rotations[bone_name]
+
+    # Angular velocity clamp: if rotation changed too much in one frame,
+    # it's likely a tracking glitch — clamp to max angular velocity
+    angle = prev.rotation_difference(new_rot).angle
+    if angle > _max_angular_velocity:
+        # Limit the change to max_angular_velocity
+        clamped_t = _max_angular_velocity / angle
+        new_rot = prev.slerp(new_rot, clamped_t)
+
+    # Temporal smoothing: slerp between previous and new
+    # _smoothing_factor = how much to keep from previous frame
+    blend = 1.0 - _smoothing_factor
+    smoothed = prev.slerp(new_rot, blend)
+
+    _prev_rotations[bone_name] = smoothed.copy()
+    return smoothed
 
 
 def store_latest_landmarks(landmarks):
@@ -301,7 +341,8 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
     if TORSO_BONE in armature.pose.bones:
         pb = armature.pose.bones[TORSO_BONE]
         pb.rotation_mode = "QUATERNION"
-        pb.rotation_quaternion = Quaternion(Vector((0, 0, 1)), -final_rotation)
+        raw = Quaternion(Vector((0, 0, 1)), -final_rotation)
+        pb.rotation_quaternion = _smooth_rotation(TORSO_BONE, raw)
 
     # --- CHEST ---
     if CHEST_BONE in _bone_cache and CHEST_BONE in _calib_rotations:
@@ -315,7 +356,7 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             calib_abs = _calib_rotations[CHEST_BONE]
             delta = calib_abs.inverted() @ current_abs
             pb.rotation_mode = "QUATERNION"
-            pb.rotation_quaternion = delta
+            pb.rotation_quaternion = _smooth_rotation(CHEST_BONE, delta)
 
     # --- HEAD ---
     if HEAD_BONE in _bone_cache and HEAD_BONE in _calib_rotations:
@@ -333,7 +374,7 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             calib_abs = _calib_rotations[HEAD_BONE]
             delta = calib_abs.inverted() @ current_abs
             pb.rotation_mode = "QUATERNION"
-            pb.rotation_quaternion = delta
+            pb.rotation_quaternion = _smooth_rotation(HEAD_BONE, delta)
 
     # --- LIMBS ---
     # Same approach for ALL bones (root and chain children):
@@ -360,7 +401,7 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
         delta = calib_abs.inverted() @ current_abs
 
         pb.rotation_mode = "QUATERNION"
-        pb.rotation_quaternion = delta
+        pb.rotation_quaternion = _smooth_rotation(bone_name, delta)
 
     # Root position:
     # X: hip midpoint X (lateral movement from image plane — reliable)

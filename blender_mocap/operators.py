@@ -11,7 +11,7 @@ from .rigify_mapper import (
     apply_pose_to_armature, compute_limb_rotations,
     calibrate, clear_calibration, is_calibrated,
     store_latest_landmarks, get_latest_landmarks,
-    clear_bone_cache, _ensure_bone_cache,
+    clear_bone_cache, _ensure_bone_cache, set_smoothing,
 )
 
 
@@ -28,6 +28,7 @@ _last_message_time = 0.0
 _bone_rest_vectors: dict = {}
 _initial_root_xy: tuple | None = None
 _initial_root_z: float | None = None
+_prev_root_loc: tuple = (0.0, 0.0, 0.0)
 _root_scale: float = 5.0
 
 
@@ -170,6 +171,7 @@ class MOCAP_OT_start_preview(Operator):
         _switch_to_fk(props.target_armature)
         clear_calibration()
         clear_bone_cache()
+        set_smoothing(props.smoothing)
         _bone_rest_vectors = _get_bone_rest_vectors(props.target_armature)
         global _initial_root_xy, _initial_root_z
         _initial_root_xy = None
@@ -525,10 +527,17 @@ def _poll_poses() -> float | None:
             if _initial_root_xy is None:
                 _initial_root_xy = xy
                 _initial_root_z = z
+            global _prev_root_loc
             dx = (xy[0] - _initial_root_xy[0]) * _root_scale
             dy = (xy[1] - _initial_root_xy[1]) * _root_scale
             dz = (z - _initial_root_z) * _root_scale
-            props.target_armature.pose.bones["root"].location = (dx, dy, dz)
+            # Smooth root position to prevent lurching
+            smooth = 1.0 - props.smoothing * 0.8  # less aggressive than rotation
+            sx = _prev_root_loc[0] + (dx - _prev_root_loc[0]) * smooth
+            sy = _prev_root_loc[1] + (dy - _prev_root_loc[1]) * smooth
+            sz = _prev_root_loc[2] + (dz - _prev_root_loc[2]) * smooth
+            _prev_root_loc = (sx, sy, sz)
+            props.target_armature.pose.bones["root"].location = (sx, sy, sz)
 
         # Force viewport update
         props.target_armature.update_tag()
