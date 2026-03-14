@@ -19,6 +19,7 @@ def _is_capture_device(index: int) -> bool:
     Metadata-only devices (common on Linux — each camera creates 2+ nodes)
     are filtered out so only usable capture devices appear in the dropdown.
     """
+    import os
     import fcntl
     import struct
     VIDIOC_QUERYCAP = 0x80685600
