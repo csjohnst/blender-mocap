@@ -115,21 +115,20 @@ def _get_target_dir(coords, mapping):
 def _compute_absolute_rotation(rest_bone, target_dir):
     """Compute the absolute rotation for a bone to point at target_dir.
 
-    Returns a Quaternion that would make the bone point from its rest
-    direction to target_dir. Computed in the bone's rest_local space.
+    Returns a Quaternion in the bone's own local frame.
+
+    IMPORTANT: Uses bone.matrix_local (bone-local → armature), NOT rest_local
+    (bone-local → parent-local). target_dir is in armature space, so we need
+    bone.matrix_local^-1 to convert it to bone-local. Using rest_local would
+    map the rotation to the wrong axis for child bones (e.g., elbow bend
+    becomes forearm twist).
     """
     from mathutils import Vector
 
-    # rest_local: the bone's rest matrix relative to its parent
-    if rest_bone.parent:
-        rest_local = rest_bone.parent.matrix_local.inverted() @ rest_bone.matrix_local
-    else:
-        rest_local = rest_bone.matrix_local
+    # Convert armature-space target direction into bone's own local frame
+    local_target = (rest_bone.matrix_local.to_3x3().inverted() @ target_dir).normalized()
 
-    # Convert target direction into the bone's rest_local frame
-    local_target = (rest_local.to_3x3().inverted() @ target_dir).normalized()
-
-    # In rest_local frame, the bone points along Y
+    # In bone-local frame, the bone points along Y
     local_rest = Vector((0, 1, 0))
 
     # Rotation from rest to target in the bone's local frame

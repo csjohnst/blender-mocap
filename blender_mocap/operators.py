@@ -171,8 +171,9 @@ class MOCAP_OT_start_preview(Operator):
         clear_calibration()
         clear_bone_cache()
         _bone_rest_vectors = _get_bone_rest_vectors(props.target_armature)
-        global _initial_root_position
-        _initial_root_position = None  # Reset — will be set from first pose frame
+        global _initial_root_xy, _initial_root_z
+        _initial_root_xy = None
+        _initial_root_z = None
 
         props.is_previewing = True
         props.status = "Previewing"
@@ -236,7 +237,7 @@ _countdown_remaining = 0
 
 def _countdown_tick() -> float | None:
     """Timer callback for recording countdown."""
-    global _countdown_remaining, _frame_buffer, _initial_root_position
+    global _countdown_remaining, _frame_buffer, _initial_root_xy, _initial_root_z
 
     scene = bpy.context.scene
     if not hasattr(scene, "mocap"):
@@ -258,7 +259,8 @@ def _countdown_tick() -> float | None:
 
     # Countdown finished — start recording
     _frame_buffer.clear()
-    _initial_root_position = None  # Reset root so recording starts from origin
+    _initial_root_xy = None  # Reset root so recording starts from origin
+    _initial_root_z = None
     _ipc_client.send_command("start_recording")
     props.is_recording = True
     props.status = "Recording"
@@ -541,7 +543,7 @@ class MOCAP_OT_reset_pose(Operator):
     bl_description = "Reset armature to rest pose and calibrate: your current pose becomes the A-pose reference"
 
     def execute(self, context):
-        global _initial_root_position
+        global _initial_root_xy, _initial_root_z
         props = context.scene.mocap
         if props.target_armature is None:
             self.report({"ERROR"}, "No armature selected")
