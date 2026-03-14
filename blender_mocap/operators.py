@@ -16,6 +16,8 @@ _ipc_client: IPCClient | None = None
 _frame_buffer = FrameBuffer()
 _last_message_time = 0.0
 _bone_rest_vectors: dict = {}
+_initial_root_position: tuple | None = None  # First frame hip position for delta tracking
+_root_scale: float = 5.0  # Scale factor: MediaPipe normalized coords -> Blender units
 
 
 def _get_bone_rest_vectors(armature) -> dict:
@@ -141,6 +143,8 @@ class MOCAP_OT_start_preview(Operator):
         # Switch Rigify limbs to FK mode and cache rest vectors
         _switch_to_fk(props.target_armature)
         _bone_rest_vectors = _get_bone_rest_vectors(props.target_armature)
+        global _initial_root_position
+        _initial_root_position = None  # Reset — will be set from first pose frame
 
         props.is_previewing = True
         props.status = "Previewing"
@@ -445,9 +449,17 @@ def _poll_poses() -> float | None:
                 pb.rotation_mode = "QUATERNION"
                 pb.rotation_quaternion = MQuaternion(quat)
 
-        if "_root_position" in rotations and "torso" in props.target_armature.pose.bones:
+        # Apply root motion — track position relative to first frame
+        if "_root_position" in rotations and "root" in props.target_armature.pose.bones:
+            global _initial_root_position
             pos = rotations["_root_position"]
-            props.target_armature.pose.bones["torso"].location = pos
+            if _initial_root_position is None:
+                _initial_root_position = pos
+            # Delta from initial position, scaled to Blender units
+            dx = (pos[0] - _initial_root_position[0]) * _root_scale
+            dy = (pos[1] - _initial_root_position[1]) * _root_scale
+            dz = (pos[2] - _initial_root_position[2]) * _root_scale
+            props.target_armature.pose.bones["root"].location = (dx, dy, dz)
 
         # Force viewport update
         props.target_armature.update_tag()

@@ -169,7 +169,10 @@ def compute_limb_rotations(
         head_vec = (nose[0] - ear_mid[0], nose[1] - ear_mid[1], nose[2] - ear_mid[2])
         rotations[HEAD_BONE] = compute_bone_rotation(bone_rest_vectors[HEAD_BONE], head_vec)
 
-    # Root position (hip midpoint)
+    # Root position (hip midpoint) — used for world-space translation
+    # Scale factor maps normalized MediaPipe coords to Blender units.
+    # MediaPipe range is ~1.0 across the frame; a typical scene scale
+    # of 5.0 gives reasonable walking distances.
     l_hip = coords[23]
     r_hip = coords[24]
     rotations["_root_position"] = (

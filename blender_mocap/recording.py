@@ -109,6 +109,9 @@ def bake_to_action(
     armature.animation_data_create()
     armature.animation_data.action = action
 
+    root_scale = 5.0  # Same scale as live preview
+    initial_pos = None
+
     for frame_data in resampled_frames:
         frame_num = frame_data["frame"] + 1  # Blender frames start at 1
         landmarks = frame_data["landmarks"]
@@ -124,9 +127,14 @@ def bake_to_action(
             pb.rotation_quaternion = MQuaternion(quat)
             pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
 
-        # Root position
-        if "_root_position" in rotations and "torso" in armature.pose.bones:
+        # Root position — delta from first frame, scaled to Blender units
+        if "_root_position" in rotations and "root" in armature.pose.bones:
             pos = rotations["_root_position"]
-            pb = armature.pose.bones["torso"]
-            pb.location = pos
+            if initial_pos is None:
+                initial_pos = pos
+            dx = (pos[0] - initial_pos[0]) * root_scale
+            dy = (pos[1] - initial_pos[1]) * root_scale
+            dz = (pos[2] - initial_pos[2]) * root_scale
+            pb = armature.pose.bones["root"]
+            pb.location = (dx, dy, dz)
             pb.keyframe_insert(data_path="location", frame=frame_num)
