@@ -67,7 +67,7 @@ _BONE_MAX_ANGULAR_VELOCITY = {
     CHEST_BONE: math.radians(20),   # ~600°/s — spine doesn't whip around
     HEAD_BONE:  math.radians(30),   # ~900°/s — head turns faster than body
 }
-_DEFAULT_MAX_ANGULAR_VELOCITY = math.radians(90)  # ~2700°/s — limbs can be fast
+_DEFAULT_MAX_ANGULAR_VELOCITY = math.radians(120)  # ~3600°/s — limbs need fast response
 
 
 def _compute_torso_metrics(landmarks_raw: list[dict]) -> tuple[float, float, float]:
@@ -418,10 +418,17 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
                      math.atan2(hip_vec.y, hip_vec.x)) / 2
         delta_angle = avg_angle - _calib_body_angle
 
-        # Large dead zone: ignore small rotations from natural body sway
-        # Only apply rotation for deliberate body turns (> 10°)
-        if abs(delta_angle) < math.radians(10):
+        # Soft dead zone: fade rotation in between 3° and 8°
+        # Prevents sudden jumps when crossing the threshold
+        abs_angle = abs(delta_angle)
+        dead_min = math.radians(3)
+        dead_max = math.radians(8)
+        if abs_angle < dead_min:
             delta_angle = 0.0
+        elif abs_angle < dead_max:
+            # Gradual fade-in from 0 to full
+            fade = (abs_angle - dead_min) / (dead_max - dead_min)
+            delta_angle = delta_angle * fade
 
         pb.rotation_mode = "QUATERNION"
         raw = Quaternion(Vector((0, 0, 1)), -delta_angle)
