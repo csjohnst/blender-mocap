@@ -60,6 +60,7 @@ _prev_rotations = {}   # bone_name -> Quaternion (previous frame, for smoothing)
 _smoothing_factor = 0.4  # 0 = no smoothing (instant), 1 = frozen. 0.4 = natural
 _max_angular_velocity = math.radians(120)  # Max degrees per frame (~30fps = 3600°/s)
 _visibility_threshold = 0.65  # Landmarks below this confidence are rejected
+_frame_counter = 0  # For periodic debug logging
 
 
 def _compute_torso_metrics(landmarks_raw: list[dict]) -> tuple[float, float, float]:
@@ -520,16 +521,27 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
     # calibration and current absolute rotations gives the correct bone-local
     # rotation_quaternion. World-space deltas don't work because
     # rotation_quaternion is interpreted in bone-local space, not world space.
+    global _frame_counter
+    _frame_counter += 1
+    debug_this_frame = (_frame_counter % 60 == 1)  # Log every ~3s
+
+    bones_applied = 0
+    bones_skipped_vis = 0
+    bones_skipped_missing = 0
+
     for bone_name, mapping in RIGIFY_BONE_MAP.items():
         if bone_name not in armature.pose.bones:
+            bones_skipped_missing += 1
             continue
         if bone_name not in _calib_rotations:
+            bones_skipped_missing += 1
             continue
 
         pb = armature.pose.bones[bone_name]
 
         # Skip bones whose landmarks have low visibility — hold previous rotation
         if not _bone_landmarks_visible(mapping, landmarks):
+            bones_skipped_vis += 1
             if bone_name in _prev_rotations:
                 pb.rotation_mode = "QUATERNION"
                 pb.rotation_quaternion = _prev_rotations[bone_name]
@@ -546,6 +558,18 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
 
         pb.rotation_mode = "QUATERNION"
         pb.rotation_quaternion = _smooth_rotation(bone_name, delta)
+        bones_applied += 1
+
+        if debug_this_frame and bone_name == "upper_arm_fk.L":
+            q = delta
+            print(f"[MoCap] DIAG frame={_frame_counter}: {bone_name}")
+            print(f"  target_dir=({target_dir.x:.3f}, {target_dir.y:.3f}, {target_dir.z:.3f})")
+            print(f"  delta quat=({q.w:.3f}, {q.x:.3f}, {q.y:.3f}, {q.z:.3f}) angle={math.degrees(q.angle):.1f}°")
+            print(f"  visibility: lm[{mapping['parent_idx']}]={landmarks[mapping['parent_idx']].get('visibility', 0):.2f} lm[{mapping['child_idx']}]={landmarks[mapping['child_idx']].get('visibility', 0):.2f}")
+            print(f"  final quat=({pb.rotation_quaternion.w:.3f}, {pb.rotation_quaternion.x:.3f}, {pb.rotation_quaternion.y:.3f}, {pb.rotation_quaternion.z:.3f})")
+
+    if debug_this_frame:
+        print(f"[MoCap] DIAG frame={_frame_counter}: applied={bones_applied} skipped_vis={bones_skipped_vis} skipped_missing={bones_skipped_missing}")
 
     # Root position:
     # X: hip midpoint X from image plane (lateral movement — reliable)
