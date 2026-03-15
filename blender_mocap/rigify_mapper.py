@@ -514,14 +514,16 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             pb.rotation_quaternion = _smooth_rotation(HEAD_BONE, delta)
 
     # --- LIMBS ---
-    # SIMPLE APPROACH: For every bone, compute world-space direction delta
-    # from calibration and set directly. No bone-local conversion — the
-    # calibration delta cancels out the bone's rest orientation so
-    # rotation_quaternion receives the correct relative change.
+    # Use bone-local absolute rotations (same approach as HEAD).
+    # _compute_absolute_rotation converts world-space direction to a rotation
+    # in the bone's own local frame via matrix_local. The delta between
+    # calibration and current absolute rotations gives the correct bone-local
+    # rotation_quaternion. World-space deltas don't work because
+    # rotation_quaternion is interpreted in bone-local space, not world space.
     for bone_name, mapping in RIGIFY_BONE_MAP.items():
         if bone_name not in armature.pose.bones:
             continue
-        if bone_name not in _calib_dirs:
+        if bone_name not in _calib_rotations:
             continue
 
         pb = armature.pose.bones[bone_name]
@@ -537,11 +539,10 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
         if target_dir.length < 1e-6:
             continue
 
-        calib_dir = _calib_dirs[bone_name]
-
-        # World-space rotation from calibration direction to current direction
-        # This IS the movement the person made — no conversion needed
-        delta = calib_dir.rotation_difference(target_dir)
+        rest_bone = _bone_cache[bone_name]
+        current_abs = _compute_absolute_rotation(rest_bone, target_dir)
+        calib_abs = _calib_rotations[bone_name]
+        delta = calib_abs.inverted() @ current_abs
 
         pb.rotation_mode = "QUATERNION"
         pb.rotation_quaternion = _smooth_rotation(bone_name, delta)
