@@ -8,7 +8,7 @@ from .ipc_client import IPCClient
 from .subprocess_manager import CaptureProcess, get_recordings_path
 from .recording import FrameBuffer, bake_to_action, next_action_name
 from .rigify_mapper import (
-    apply_pose_to_armature, compute_limb_rotations,
+    apply_pose_to_armature,
     calibrate, clear_calibration, is_calibrated,
     store_latest_landmarks, get_latest_landmarks,
     clear_bone_cache, _ensure_bone_cache, set_smoothing,
@@ -203,7 +203,7 @@ class MOCAP_OT_stop_preview(Operator):
                 resampled = _frame_buffer.resample(target_fps=scene_fps)
                 existing = [r.name for r in props.recordings]
                 action_name = next_action_name(existing)
-                bake_to_action(props.target_armature, resampled, _bone_rest_vectors, action_name)
+                bake_to_action(props.target_armature, resampled, {}, action_name)
 
                 # Add to recordings list
                 rec = props.recordings.add()

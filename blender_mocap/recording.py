@@ -99,42 +99,53 @@ def bake_to_action(
 ) -> None:
     """Bake resampled landmark frames into a Blender Action.
 
+    Uses apply_pose_to_armature (same as live preview) so the baked
+    animation matches what was shown during capture. The calibration
+    state from the live session is still active, so deltas are consistent.
+
     Must be called from Blender's Python context.
     """
     import bpy
-    from mathutils import Quaternion as MQuaternion
-    from .rigify_mapper import compute_limb_rotations
+    from .rigify_mapper import (
+        apply_pose_to_armature, RIGIFY_BONE_MAP, CHEST_BONE, HEAD_BONE,
+        TORSO_BONE,
+    )
 
     action = bpy.data.actions.new(name=action_name)
     armature.animation_data_create()
     armature.animation_data.action = action
 
     root_scale = 5.0  # Same scale as live preview
-    initial_pos = None
+    initial_root_xy = None
+    initial_root_z = None
+
+    # All bones that might be rotated by apply_pose_to_armature
+    all_bone_names = list(RIGIFY_BONE_MAP.keys()) + [CHEST_BONE, HEAD_BONE, TORSO_BONE]
 
     for frame_data in resampled_frames:
         frame_num = frame_data["frame"] + 1  # Blender frames start at 1
         landmarks = frame_data["landmarks"]
-        rotations = compute_limb_rotations(landmarks, bone_rest_vectors)
 
-        for bone_name, quat in rotations.items():
-            if bone_name == "_root_position":
-                continue
+        # Apply pose using the same function as live preview
+        result = apply_pose_to_armature(landmarks, armature)
+
+        # Keyframe all pose bones that were set
+        for bone_name in all_bone_names:
             if bone_name not in armature.pose.bones:
                 continue
             pb = armature.pose.bones[bone_name]
-            pb.rotation_mode = "QUATERNION"
-            pb.rotation_quaternion = MQuaternion(quat)
             pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
 
-        # Root position — delta from first frame, scaled to Blender units
-        if "_root_position" in rotations and "root" in armature.pose.bones:
-            pos = rotations["_root_position"]
-            if initial_pos is None:
-                initial_pos = pos
-            dx = (pos[0] - initial_pos[0]) * root_scale
-            dy = (pos[1] - initial_pos[1]) * root_scale
-            dz = (pos[2] - initial_pos[2]) * root_scale
+        # Root position — same logic as _poll_poses in operators.py
+        if "_root_xy" in result and "root" in armature.pose.bones:
+            xy = result["_root_xy"]
+            z = result["_root_z"]
+            if initial_root_xy is None:
+                initial_root_xy = xy
+                initial_root_z = z
+            dx = (xy[0] - initial_root_xy[0]) * root_scale
+            dy = (xy[1] - initial_root_xy[1]) * root_scale
+            dz = (z - initial_root_z) * root_scale
             pb = armature.pose.bones["root"]
             pb.location = (dx, dy, dz)
             pb.keyframe_insert(data_path="location", frame=frame_num)
