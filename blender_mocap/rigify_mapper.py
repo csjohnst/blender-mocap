@@ -377,22 +377,31 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             pb.rotation_quaternion = _smooth_rotation(HEAD_BONE, delta)
 
     # --- LIMBS ---
-    # Same approach for ALL bones (root and chain children):
-    # Compute absolute rotation in bone's rest_local space, take calibration delta.
-    # For chain children this slightly over-counts the parent's rotation change,
-    # but it produces correct visible bending at elbows and knees.
-    for bone_name, mapping in RIGIFY_BONE_MAP.items():
-        if bone_name not in armature.pose.bones:
-            continue
-        if bone_name not in _bone_cache:
+    # Process ROOT bones first (upper_arm, thigh), then CHILDREN (forearm, shin, etc.)
+    # For children, include the parent's computed rotation when converting
+    # target direction to bone-local space. This is critical for large
+    # parent rotations (e.g., T-pose bicep flex = 90° shoulder rotation).
+    computed_quats = {}  # bone_name -> Quaternion we set
+
+    # Separate into roots and children
+    root_bones = [n for n in RIGIFY_BONE_MAP if n not in FK_CHAIN_PARENT]
+    child_bones_ordered = [
+        # Process level by level: forearm/shin first, then hand/foot
+        n for n in ["forearm_fk.L", "forearm_fk.R", "shin_fk.L", "shin_fk.R",
+                    "hand_fk.L", "hand_fk.R", "foot_fk.L", "foot_fk.R"]
+        if n in FK_CHAIN_PARENT
+    ]
+
+    # ROOT BONES: use bone.matrix_local (parent is at rest)
+    for bone_name in root_bones:
+        if bone_name not in armature.pose.bones or bone_name not in _bone_cache:
             continue
         if bone_name not in _calib_rotations:
             continue
 
         pb = armature.pose.bones[bone_name]
         rest_bone = _bone_cache[bone_name]
-        target_dir = _get_target_dir(coords, mapping)
-
+        target_dir = _get_target_dir(coords, RIGIFY_BONE_MAP[bone_name])
         if target_dir.length < 1e-6:
             continue
 
@@ -402,6 +411,48 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
 
         pb.rotation_mode = "QUATERNION"
         pb.rotation_quaternion = _smooth_rotation(bone_name, delta)
+        computed_quats[bone_name] = delta
+
+    # CHILD BONES: include parent's rotation in the conversion
+    for bone_name in child_bones_ordered:
+        if bone_name not in armature.pose.bones or bone_name not in _bone_cache:
+            continue
+        if bone_name not in _calib_rotations:
+            continue
+
+        pb = armature.pose.bones[bone_name]
+        rest_bone = _bone_cache[bone_name]
+        target_dir = _get_target_dir(coords, RIGIFY_BONE_MAP[bone_name])
+        if target_dir.length < 1e-6:
+            continue
+
+        parent_name = FK_CHAIN_PARENT[bone_name]
+
+        if parent_name in computed_quats and parent_name in _bone_cache:
+            # Parent's current 3x3 = rest orientation @ our applied rotation
+            parent_q = computed_quats[parent_name]
+            parent_bone = _bone_cache[parent_name]
+            parent_current_3x3 = parent_bone.matrix_local.to_3x3() @ parent_q.to_matrix()
+
+            # rest_local: this bone's rest transform relative to parent
+            rest_local_3x3 = (parent_bone.matrix_local.inverted() @ rest_bone.matrix_local).to_3x3()
+
+            # Effective 3x3: parent's current orientation @ bone's rest_local
+            effective_3x3 = parent_current_3x3 @ rest_local_3x3
+
+            # Convert target direction including parent's rotation
+            local_target = (effective_3x3.inverted() @ target_dir).normalized()
+            current_abs = Vector((0, 1, 0)).rotation_difference(local_target)
+        else:
+            # Fallback: treat like root bone
+            current_abs = _compute_absolute_rotation(rest_bone, target_dir)
+
+        calib_abs = _calib_rotations[bone_name]
+        delta = calib_abs.inverted() @ current_abs
+
+        pb.rotation_mode = "QUATERNION"
+        pb.rotation_quaternion = _smooth_rotation(bone_name, delta)
+        computed_quats[bone_name] = delta
 
     # Root position:
     # X: hip midpoint X (lateral movement from image plane — reliable)
