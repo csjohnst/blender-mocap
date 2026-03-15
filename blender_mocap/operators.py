@@ -539,12 +539,12 @@ def _poll_poses() -> float | None:
             _prev_root_loc = (sx, sy, sz)
             props.target_armature.pose.bones["root"].location = (sx, sy, sz)
 
-        # Tag armature for redraw — Blender's viewport will pick this up
-        # on its next draw cycle. Avoid view_layer.update() which forces
-        # a full depsgraph recomputation at 30Hz and causes thermal throttling.
-        props.target_armature.update_tag(refresh={'OBJECT'})
+        # Force depsgraph evaluation — required for pose bone changes to
+        # be visible. update_tag() alone is NOT sufficient for pose bones.
+        props.target_armature.update_tag()
+        bpy.context.view_layer.update()
 
-    return 0.033  # ~30Hz
+    return 0.05  # 20Hz — reduced from 30Hz to lower thermal load
 
 
 class MOCAP_OT_reset_pose(Operator):
