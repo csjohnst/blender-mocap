@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from bl_info
+        id: version
+        run: |
+          VERSION=$(python3 -c "
+          import ast, re
+          with open('blender_mocap/__init__.py') as f:
+              content = f.read()
+          match = re.search(r'\"version\":\s*\((\d+),\s*(\d+),\s*(\d+)\)', content)
+          print(f'{match.group(1)}.{match.group(2)}.{match.group(3)}')
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag already exists
+        id: check_tag
+        run: |
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build addon zip
+        if: steps.check_tag.outputs.exists == 'false'
+        run: ./scripts/build_addon.sh
+
+      - name: Create release
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Blender Motion Capture ${{ steps.version.outputs.tag }}
+          body: |
+            ## Blender Motion Capture ${{ steps.version.outputs.tag }}
+
+            ### Installation
+            1. Download `blender_mocap.zip` below
+            2. In Blender: **Edit → Preferences → Add-ons → Install**
+            3. Select the zip file and enable **"Motion Capture"**
+
+            See [Quick Start Guide](docs/quickstart.md) for full setup instructions.
+          files: dist/blender_mocap.zip
+          generate_release_notes: true
