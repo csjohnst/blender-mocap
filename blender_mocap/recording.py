@@ -103,6 +103,9 @@ def bake_to_action(
     animation matches what was shown during capture. The calibration
     state from the live session is still active, so deltas are consistent.
 
+    Keyframes both location and rotation_quaternion for every pose bone
+    on every frame to ensure clean playback.
+
     Must be called from Blender's Python context.
     """
     import bpy
@@ -119,22 +122,20 @@ def bake_to_action(
     initial_root_xy = None
     initial_root_z = None
 
-    # All bones that might be rotated by apply_pose_to_armature
+    # All bones that apply_pose_to_armature may touch
     all_bone_names = list(RIGIFY_BONE_MAP.keys()) + [CHEST_BONE, HEAD_BONE, TORSO_BONE]
+
+    print(f"[MoCap] Baking {len(resampled_frames)} frames to action '{action_name}'...")
 
     for frame_data in resampled_frames:
         frame_num = frame_data["frame"] + 1  # Blender frames start at 1
         landmarks = frame_data["landmarks"]
 
+        # Set Blender's current frame so depsgraph evaluates correctly
+        bpy.context.scene.frame_set(frame_num)
+
         # Apply pose using the same function as live preview
         result = apply_pose_to_armature(landmarks, armature)
-
-        # Keyframe all pose bones that were set
-        for bone_name in all_bone_names:
-            if bone_name not in armature.pose.bones:
-                continue
-            pb = armature.pose.bones[bone_name]
-            pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
 
         # Root position — same logic as _poll_poses in operators.py
         if "_root_xy" in result and "root" in armature.pose.bones:
@@ -146,6 +147,28 @@ def bake_to_action(
             dx = (xy[0] - initial_root_xy[0]) * root_scale
             dy = (xy[1] - initial_root_xy[1]) * root_scale
             dz = (z - initial_root_z) * root_scale
-            pb = armature.pose.bones["root"]
-            pb.location = (dx, dy, dz)
+            armature.pose.bones["root"].location = (dx, dy, dz)
+
+        # Force depsgraph to evaluate the pose before keyframing
+        bpy.context.view_layer.update()
+
+        # Keyframe location and rotation for all affected bones
+        for bone_name in all_bone_names:
+            if bone_name not in armature.pose.bones:
+                continue
+            pb = armature.pose.bones[bone_name]
+            pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
             pb.keyframe_insert(data_path="location", frame=frame_num)
+
+        # Also keyframe root bone
+        if "root" in armature.pose.bones:
+            pb = armature.pose.bones["root"]
+            pb.keyframe_insert(data_path="location", frame=frame_num)
+            pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
+
+    # Set playback range to match the baked animation
+    bpy.context.scene.frame_start = 1
+    bpy.context.scene.frame_end = len(resampled_frames)
+    bpy.context.scene.frame_set(1)
+
+    print(f"[MoCap] Baked {len(resampled_frames)} frames, range 1-{len(resampled_frames)}")
