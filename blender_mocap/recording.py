@@ -99,45 +99,44 @@ def bake_to_action(
 ) -> None:
     """Bake resampled landmark frames into a Blender Action.
 
-    Uses apply_pose_to_armature (same as live preview) so the baked
-    animation matches what was shown during capture. The calibration
-    state from the live session is still active, so deltas are consistent.
-
-    Keyframes both location and rotation_quaternion for every pose bone
-    on every frame to ensure clean playback.
+    Applies the pose for each frame using the same function as live preview,
+    then keyframes location and rotation_quaternion for EVERY pose bone on
+    EVERY frame. This guarantees exact playback with no interpolation issues.
 
     Must be called from Blender's Python context.
     """
     import bpy
-    from .rigify_mapper import (
-        apply_pose_to_armature, RIGIFY_BONE_MAP, CHEST_BONE, HEAD_BONE,
-        TORSO_BONE,
-    )
+    from .rigify_mapper import apply_pose_to_armature
 
     action = bpy.data.actions.new(name=action_name)
     armature.animation_data_create()
     armature.animation_data.action = action
 
-    root_scale = 5.0  # Same scale as live preview
+    root_scale = 5.0
     initial_root_xy = None
     initial_root_z = None
 
-    # All bones that apply_pose_to_armature may touch
-    all_bone_names = list(RIGIFY_BONE_MAP.keys()) + [CHEST_BONE, HEAD_BONE, TORSO_BONE]
+    # Get ALL pose bones — keyframe everything, not just our mapped subset
+    all_pose_bones = list(armature.pose.bones)
 
-    print(f"[MoCap] Baking {len(resampled_frames)} frames to action '{action_name}'...")
+    # Ensure every bone is in quaternion mode
+    for pb in all_pose_bones:
+        pb.rotation_mode = "QUATERNION"
 
-    for frame_data in resampled_frames:
+    num_frames = len(resampled_frames)
+    print(f"[MoCap] Baking {num_frames} frames to action '{action_name}'...")
+
+    for i, frame_data in enumerate(resampled_frames):
         frame_num = frame_data["frame"] + 1  # Blender frames start at 1
         landmarks = frame_data["landmarks"]
 
-        # Set Blender's current frame so depsgraph evaluates correctly
+        # Set scene frame
         bpy.context.scene.frame_set(frame_num)
 
-        # Apply pose using the same function as live preview
+        # Apply pose (same function as live preview)
         result = apply_pose_to_armature(landmarks, armature)
 
-        # Root position — same logic as _poll_poses in operators.py
+        # Root position
         if "_root_xy" in result and "root" in armature.pose.bones:
             xy = result["_root_xy"]
             z = result["_root_z"]
@@ -149,26 +148,21 @@ def bake_to_action(
             dz = (z - initial_root_z) * root_scale
             armature.pose.bones["root"].location = (dx, dy, dz)
 
-        # Force depsgraph to evaluate the pose before keyframing
+        # Evaluate depsgraph so all bone transforms are final
         bpy.context.view_layer.update()
 
-        # Keyframe location and rotation for all affected bones
-        for bone_name in all_bone_names:
-            if bone_name not in armature.pose.bones:
-                continue
-            pb = armature.pose.bones[bone_name]
+        # Keyframe location and rotation for EVERY pose bone
+        for pb in all_pose_bones:
             pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
             pb.keyframe_insert(data_path="location", frame=frame_num)
 
-        # Also keyframe root bone
-        if "root" in armature.pose.bones:
-            pb = armature.pose.bones["root"]
-            pb.keyframe_insert(data_path="location", frame=frame_num)
-            pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
+        # Progress logging every 50 frames
+        if (i + 1) % 50 == 0 or i == num_frames - 1:
+            print(f"[MoCap] Baked {i + 1}/{num_frames} frames")
 
-    # Set playback range to match the baked animation
+    # Set playback range
     bpy.context.scene.frame_start = 1
-    bpy.context.scene.frame_end = len(resampled_frames)
+    bpy.context.scene.frame_end = num_frames
     bpy.context.scene.frame_set(1)
 
-    print(f"[MoCap] Baked {len(resampled_frames)} frames, range 1-{len(resampled_frames)}")
+    print(f"[MoCap] Done — action '{action_name}', frames 1-{num_frames}")
