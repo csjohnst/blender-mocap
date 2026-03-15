@@ -105,14 +105,78 @@ def mediapipe_to_blender_coords(lm: dict) -> tuple[float, float, float]:
     return bx, by, bz
 
 
-def _get_target_dir(coords, mapping):
-    """Get target direction from landmark coordinates."""
+# Calibration 2D lengths for each bone (image-plane distance at calibration)
+_calib_2d_lengths = {}
+
+
+def _reconstruct_3d_direction(parent_lm, child_lm, calib_2d_length):
+    """Reconstruct 3D bone direction from 2D image projection + length constraint.
+
+    Uses reliable image-plane X,Y and computes depth via trigonometry:
+    - If the bone appears shorter in the image than at calibration,
+      it must have rotated out of the image plane
+    - depth² = calib_length² - apparent_length² (Pythagorean theorem)
+    - Sign of depth from MediaPipe Z (approximate direction is fine)
+
+    This is FAR more accurate than using MediaPipe's Z directly.
+    """
+    # 2D components from image plane (reliable)
+    dx = child_lm["x"] - parent_lm["x"]       # lateral
+    dy_img = child_lm["y"] - parent_lm["y"]   # vertical in image
+
+    # 2D projected length
+    length_2d = math.sqrt(dx**2 + dy_img**2)
+
+    # Depth from foreshortening
+    if length_2d < calib_2d_length and calib_2d_length > 1e-6:
+        depth = math.sqrt(max(0, calib_2d_length**2 - length_2d**2))
+    else:
+        depth = 0.0
+
+    # Sign of depth from MediaPipe Z (direction is OK even if magnitude isn't)
+    z_parent = parent_lm["z"]
+    z_child = child_lm["z"]
+    if z_child > z_parent:  # child farther from camera
+        depth = -depth  # negative Y in Blender = away from camera
+
+    # Convert to Blender coordinates
+    bx = dx                # image X → Blender X
+    by = depth             # computed depth → Blender Y
+    bz = -dy_img           # image Y inverted → Blender Z (up)
+
+    length = math.sqrt(bx**2 + by**2 + bz**2)
+    if length < 1e-8:
+        return (0.0, 0.0, -1.0)  # default: pointing down
+    return (bx / length, by / length, bz / length)
+
+
+def _get_target_dir(coords, mapping, landmarks_raw=None):
+    """Get target direction from landmark coordinates.
+
+    If landmarks_raw and calibration 2D lengths are available, uses
+    trigonometric depth reconstruction. Otherwise falls back to
+    coordinate-based direction.
+    """
     from mathutils import Vector
+
     if mapping.get("type") == "foot":
         heel_idx, toe_idx = mapping["indices"]
+        if landmarks_raw and f"foot_{heel_idx}" in _calib_2d_lengths:
+            d = _reconstruct_3d_direction(
+                landmarks_raw[heel_idx], landmarks_raw[toe_idx],
+                _calib_2d_lengths[f"foot_{heel_idx}"])
+            return Vector(d)
         return (coords[toe_idx] - coords[heel_idx]).normalized()
     else:
-        return (coords[mapping["child_idx"]] - coords[mapping["parent_idx"]]).normalized()
+        parent_idx = mapping["parent_idx"]
+        child_idx = mapping["child_idx"]
+        key = f"{parent_idx}_{child_idx}"
+        if landmarks_raw and key in _calib_2d_lengths:
+            d = _reconstruct_3d_direction(
+                landmarks_raw[parent_idx], landmarks_raw[child_idx],
+                _calib_2d_lengths[key])
+            return Vector(d)
+        return (coords[child_idx] - coords[parent_idx]).normalized()
 
 
 def _compute_absolute_rotation(rest_bone, target_dir):
@@ -154,13 +218,30 @@ def calibrate(landmarks: list[dict]) -> None:
 
     print("[MoCap] === CALIBRATION ===")
 
-    # Calibrate limb bones
+    # Store 2D bone lengths at calibration for trigonometric depth reconstruction
+    global _calib_2d_lengths
+    _calib_2d_lengths = {}
+    for bone_name, mapping in RIGIFY_BONE_MAP.items():
+        if mapping.get("type") == "foot":
+            heel_idx, toe_idx = mapping["indices"]
+            dx = landmarks[toe_idx]["x"] - landmarks[heel_idx]["x"]
+            dy = landmarks[toe_idx]["y"] - landmarks[heel_idx]["y"]
+            _calib_2d_lengths[f"foot_{heel_idx}"] = math.sqrt(dx**2 + dy**2)
+        else:
+            p_idx, c_idx = mapping["parent_idx"], mapping["child_idx"]
+            dx = landmarks[c_idx]["x"] - landmarks[p_idx]["x"]
+            dy = landmarks[c_idx]["y"] - landmarks[p_idx]["y"]
+            _calib_2d_lengths[f"{p_idx}_{c_idx}"] = math.sqrt(dx**2 + dy**2)
+
+    print(f"  2D lengths stored: {len(_calib_2d_lengths)}")
+
+    # Calibrate limb bones using trig-reconstructed directions
     for bone_name in _bone_cache:
         if bone_name not in RIGIFY_BONE_MAP:
             continue
         mapping = RIGIFY_BONE_MAP[bone_name]
         rest_bone = _bone_cache[bone_name]
-        target_dir = _get_target_dir(coords, mapping)
+        target_dir = _get_target_dir(coords, mapping, landmarks)
         if target_dir.length < 1e-6:
             continue
         abs_rot = _compute_absolute_rotation(rest_bone, target_dir)
@@ -435,7 +516,7 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
 
         pb = armature.pose.bones[bone_name]
         rest_bone = _bone_cache[bone_name]
-        target_dir = _get_target_dir(coords, RIGIFY_BONE_MAP[bone_name])
+        target_dir = _get_target_dir(coords, RIGIFY_BONE_MAP[bone_name], landmarks)
         if target_dir.length < 1e-6:
             continue
 
@@ -456,7 +537,7 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
 
         pb = armature.pose.bones[bone_name]
         rest_bone = _bone_cache[bone_name]
-        target_dir = _get_target_dir(coords, RIGIFY_BONE_MAP[bone_name])
+        target_dir = _get_target_dir(coords, RIGIFY_BONE_MAP[bone_name], landmarks)
         if target_dir.length < 1e-6:
             continue
 
