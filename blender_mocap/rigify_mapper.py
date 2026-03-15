@@ -59,6 +59,7 @@ _latest_landmarks = None
 _prev_rotations = {}   # bone_name -> Quaternion (previous frame, for smoothing)
 _smoothing_factor = 0.4  # 0 = no smoothing (instant), 1 = frozen. 0.4 = natural
 _max_angular_velocity = math.radians(120)  # Max degrees per frame (~30fps = 3600°/s)
+_visibility_threshold = 0.65  # Landmarks below this confidence are rejected
 
 
 def _compute_torso_metrics(landmarks_raw: list[dict]) -> tuple[float, float, float]:
@@ -148,6 +149,23 @@ def _reconstruct_3d_direction(parent_lm, child_lm, calib_2d_length):
     if length < 1e-8:
         return (0.0, 0.0, -1.0)  # default: pointing down
     return (bx / length, by / length, bz / length)
+
+
+def _bone_landmarks_visible(mapping, landmarks_raw) -> bool:
+    """Check if the landmarks for a bone mapping have sufficient visibility."""
+    if landmarks_raw is None:
+        return True  # No visibility data, assume visible
+
+    if mapping.get("type") == "foot":
+        indices = mapping["indices"]
+    else:
+        indices = [mapping["parent_idx"], mapping["child_idx"]]
+
+    for idx in indices:
+        vis = landmarks_raw[idx].get("visibility", 1.0)
+        if vis < _visibility_threshold:
+            return False
+    return True
 
 
 def _get_target_dir(coords, mapping, landmarks_raw=None):
@@ -474,7 +492,11 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
         pb.rotation_quaternion = _smooth_rotation(CHEST_BONE, chest_rot)
 
     # --- HEAD ---
-    if HEAD_BONE in _bone_cache and HEAD_BONE in _calib_rotations:
+    head_landmarks_visible = all(
+        landmarks[i].get("visibility", 1.0) >= _visibility_threshold
+        for i in [0, 7, 8]  # nose, left ear, right ear
+    )
+    if HEAD_BONE in _bone_cache and HEAD_BONE in _calib_rotations and head_landmarks_visible:
         pb = armature.pose.bones[HEAD_BONE]
         rest_bone = _bone_cache[HEAD_BONE]
         l_ear, r_ear, nose = coords[7], coords[8], coords[0]
@@ -503,6 +525,14 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             continue
 
         pb = armature.pose.bones[bone_name]
+
+        # Skip bones whose landmarks have low visibility — hold previous rotation
+        if not _bone_landmarks_visible(mapping, landmarks):
+            if bone_name in _prev_rotations:
+                pb.rotation_mode = "QUATERNION"
+                pb.rotation_quaternion = _prev_rotations[bone_name]
+            continue
+
         target_dir = _get_target_dir(coords, mapping, landmarks)
         if target_dir.length < 1e-6:
             continue
