@@ -58,7 +58,16 @@ _is_calibrated = False
 _latest_landmarks = None
 _prev_rotations = {}   # bone_name -> Quaternion (previous frame, for smoothing)
 _smoothing_factor = 0.4  # 0 = no smoothing (instant), 1 = frozen. 0.4 = natural
-_max_angular_velocity = math.radians(120)  # Max degrees per frame (~30fps = 3600°/s)
+
+# Per-bone angular velocity limits (degrees per frame at ~30fps)
+# A human can't rotate their torso 180° instantly — limit to ~30°/s
+# Limbs can move faster but still have physical limits
+_BONE_MAX_ANGULAR_VELOCITY = {
+    TORSO_BONE: math.radians(15),   # ~450°/s — slow, deliberate body turns only
+    CHEST_BONE: math.radians(20),   # ~600°/s — spine doesn't whip around
+    HEAD_BONE:  math.radians(30),   # ~900°/s — head turns faster than body
+}
+_DEFAULT_MAX_ANGULAR_VELOCITY = math.radians(90)  # ~2700°/s — limbs can be fast
 
 
 def _compute_torso_metrics(landmarks_raw: list[dict]) -> tuple[float, float, float]:
@@ -301,7 +310,8 @@ def set_smoothing(value: float) -> None:
 def _smooth_rotation(bone_name, new_rot):
     """Apply temporal smoothing and angular velocity clamping to a rotation.
 
-    Returns the smoothed quaternion.
+    Uses per-bone velocity limits — torso/chest/head are much slower
+    than limbs to prevent unrealistic instant body flips.
     """
     from mathutils import Quaternion
 
@@ -311,19 +321,25 @@ def _smooth_rotation(bone_name, new_rot):
 
     prev = _prev_rotations[bone_name]
 
-    # Angular velocity clamp: if rotation changed too much in one frame,
-    # it's likely a tracking glitch — clamp to max angular velocity
+    # Per-bone angular velocity clamp
+    max_vel = _BONE_MAX_ANGULAR_VELOCITY.get(bone_name, _DEFAULT_MAX_ANGULAR_VELOCITY)
     angle = prev.rotation_difference(new_rot).angle
-    if angle > _max_angular_velocity:
-        # Limit the change to max_angular_velocity
-        clamped_t = _max_angular_velocity / angle
+    if angle > max_vel:
+        clamped_t = max_vel / angle
         new_rot = prev.slerp(new_rot, clamped_t)
 
-    # Temporal smoothing: slerp between previous and new
-    # _smoothing_factor = how much to keep from previous frame
-    blend = 1.0 - _smoothing_factor
-    smoothed = prev.slerp(new_rot, blend)
+    # Per-bone smoothing: torso/chest get heavier smoothing
+    if bone_name in (TORSO_BONE, CHEST_BONE):
+        # Torso: very heavy smoothing — 80% previous, 20% new
+        blend = 0.2
+    elif bone_name == HEAD_BONE:
+        # Head: moderate smoothing
+        blend = 0.4
+    else:
+        # Limbs: use user's smoothing setting
+        blend = 1.0 - _smoothing_factor
 
+    smoothed = prev.slerp(new_rot, blend)
     _prev_rotations[bone_name] = smoothed.copy()
     return smoothed
 
@@ -379,50 +395,37 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
     if not _is_calibrated:
         calibrate(landmarks)
 
-    # --- DEPTH & ROTATION from torso geometry ---
+    # --- DEPTH from torso geometry ---
     current_torso_size, current_shoulder_w, _ = _compute_torso_metrics(landmarks)
 
-    # Depth ratio: how much closer/farther than calibration
-    # Larger apparent size = closer = depth_ratio < 1
     if current_torso_size > 1e-6 and _calib_torso_size > 1e-6:
         depth_ratio = _calib_torso_size / current_torso_size
     else:
         depth_ratio = 1.0
 
-    # Body rotation from shoulder width foreshortening
-    # cos(θ) = (apparent_shoulder_w / calib_shoulder_w) * depth_ratio
-    # When rotated, shoulders appear narrower; depth_ratio corrects for distance changes
-    if _calib_shoulder_width > 1e-6:
-        cos_theta = min(1.0, (current_shoulder_w / _calib_shoulder_width) * depth_ratio)
-        # Determine rotation sign from shoulder depth difference
-        # In our coords, deeper shoulder has more negative Y (by = lm.z)
-        l_shoulder_depth = landmarks[11]["z"]
-        r_shoulder_depth = landmarks[12]["z"]
-        rotation_sign = 1.0 if l_shoulder_depth < r_shoulder_depth else -1.0
-        body_rotation = rotation_sign * math.acos(max(0.0, cos_theta))
-    else:
-        body_rotation = 0.0
-
-    # Also compute body rotation from shoulder/hip line in XZ plane
-    shoulder_vec = (coords[12] - coords[11]).normalized()
-    hip_vec = (coords[24] - coords[23]).normalized()
-    avg_angle = (math.atan2(shoulder_vec.y, shoulder_vec.x) +
-                 math.atan2(hip_vec.y, hip_vec.x)) / 2
-    line_rotation = avg_angle - _calib_body_angle
-
-    # Blend: use trig rotation for large turns, line angle for small adjustments
-    if abs(body_rotation) > math.radians(10):
-        final_rotation = body_rotation
-    elif abs(line_rotation) > math.radians(5):
-        final_rotation = line_rotation
-    else:
-        final_rotation = 0.0
-
     # --- TORSO ROTATION ---
+    # Use ONLY the image-plane shoulder/hip line angle (stable and reliable).
+    # Do NOT use MediaPipe Z for rotation sign — Z is noisy and causes
+    # instant 180° body flips when head movement confuses the depth estimate.
+    # The model should essentially stay facing the camera unless the person
+    # deliberately turns their body.
     if TORSO_BONE in armature.pose.bones:
         pb = armature.pose.bones[TORSO_BONE]
+
+        shoulder_vec = (coords[12] - coords[11]).normalized()
+        hip_vec = (coords[24] - coords[23]).normalized()
+        avg_angle = (math.atan2(shoulder_vec.y, shoulder_vec.x) +
+                     math.atan2(hip_vec.y, hip_vec.x)) / 2
+        delta_angle = avg_angle - _calib_body_angle
+
+        # Large dead zone: ignore small rotations from natural body sway
+        # Only apply rotation for deliberate body turns (> 10°)
+        if abs(delta_angle) < math.radians(10):
+            delta_angle = 0.0
+
         pb.rotation_mode = "QUATERNION"
-        raw = Quaternion(Vector((0, 0, 1)), -final_rotation)
+        raw = Quaternion(Vector((0, 0, 1)), -delta_angle)
+        # Heavy smoothing + low velocity limit prevents instant flips
         pb.rotation_quaternion = _smooth_rotation(TORSO_BONE, raw)
 
     # --- CHEST (spine lean) ---
