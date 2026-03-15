@@ -45,31 +45,25 @@ def _get_bone_rest_vectors(armature) -> dict:
     return vectors
 
 
-def _switch_to_fk(armature) -> None:
-    """Switch all Rigify limbs to FK mode so we can set rotations directly."""
+def _ensure_ik_mode(armature) -> None:
+    """Ensure all Rigify limbs are in IK mode (IK_FK = 0.0)."""
     from .rigify_mapper import IK_FK_SWITCH_BONES
-    print("[MoCap] === FK SWITCH ===")
+    print("[MoCap] === IK MODE ===")
     for ik_bone_name in IK_FK_SWITCH_BONES:
         if ik_bone_name in armature.pose.bones:
             pb = armature.pose.bones[ik_bone_name]
             if "IK_FK" in pb:
-                pb["IK_FK"] = 1.0
-                print(f"  {ik_bone_name}: IK_FK set to 1.0 (FK mode)")
+                pb["IK_FK"] = 0.0
+                print(f"  {ik_bone_name}: IK_FK set to 0.0 (IK mode)")
             else:
-                # Try to find any IK/FK property
-                found = False
                 for key in pb.keys():
                     if key.startswith("_"):
                         continue
                     if "ik" in key.lower() or "fk" in key.lower():
-                        print(f"  {ik_bone_name}: found property '{key}' = {pb[key]}")
-                        pb[key] = 1.0
-                        found = True
-                if not found:
-                    print(f"  WARNING: {ik_bone_name} has no IK_FK property! Custom props: {list(pb.keys())}")
+                        pb[key] = 0.0
+                        print(f"  {ik_bone_name}: {key} set to 0.0")
         else:
-            print(f"  WARNING: {ik_bone_name} not found! Available bones with 'parent': "
-                  f"{[b.name for b in armature.pose.bones if 'parent' in b.name]}")
+            print(f"  WARNING: {ik_bone_name} not found")
 
 
 class MOCAP_OT_start_preview(Operator):
@@ -167,8 +161,8 @@ class MOCAP_OT_start_preview(Operator):
         _ipc_client.send_command("start_preview")
         _last_message_time = time.time()
 
-        # Switch Rigify limbs to FK mode, reset calibration
-        _switch_to_fk(props.target_armature)
+        # Ensure Rigify limbs are in IK mode, reset calibration
+        _ensure_ik_mode(props.target_armature)
         clear_calibration()
         clear_bone_cache()
         set_smoothing(props.smoothing)
