@@ -492,51 +492,25 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             pb.rotation_quaternion = _smooth_rotation(HEAD_BONE, delta)
 
     # --- LIMBS ---
-    # ROOT bones (upper_arm, thigh): use bone.matrix_local for correct
-    # bone-local conversion. These bones' parents are at rest (MCH bones
-    # we don't modify), so bone.matrix_local gives the right frame.
-    #
-    # CHILD bones (forearm, shin, hand, foot): use world-space delta.
-    # bone.matrix_local doesn't account for parent rotation, but the
-    # world-space delta at least produces correct visible bending.
-    root_bones = [n for n in RIGIFY_BONE_MAP if n not in FK_CHAIN_PARENT]
-    child_bones = [n for n in RIGIFY_BONE_MAP if n in FK_CHAIN_PARENT]
-
-    for bone_name in root_bones:
-        if bone_name not in armature.pose.bones or bone_name not in _bone_cache:
-            continue
-        if bone_name not in _calib_rotations:
-            continue
-
-        mapping = RIGIFY_BONE_MAP[bone_name]
-        pb = armature.pose.bones[bone_name]
-        rest_bone = _bone_cache[bone_name]
-        target_dir = _get_target_dir(coords, mapping, landmarks)
-        if target_dir.length < 1e-6:
-            continue
-
-        # Proper bone-local conversion via bone.matrix_local
-        current_abs = _compute_absolute_rotation(rest_bone, target_dir)
-        calib_abs = _calib_rotations[bone_name]
-        delta = calib_abs.inverted() @ current_abs
-
-        pb.rotation_mode = "QUATERNION"
-        pb.rotation_quaternion = _smooth_rotation(bone_name, delta)
-
-    for bone_name in child_bones:
+    # SIMPLE APPROACH: For every bone, compute world-space direction delta
+    # from calibration and set directly. No bone-local conversion — the
+    # calibration delta cancels out the bone's rest orientation so
+    # rotation_quaternion receives the correct relative change.
+    for bone_name, mapping in RIGIFY_BONE_MAP.items():
         if bone_name not in armature.pose.bones:
             continue
         if bone_name not in _calib_dirs:
             continue
 
-        mapping = RIGIFY_BONE_MAP[bone_name]
         pb = armature.pose.bones[bone_name]
         target_dir = _get_target_dir(coords, mapping, landmarks)
         if target_dir.length < 1e-6:
             continue
 
-        # World-space delta for chain children
         calib_dir = _calib_dirs[bone_name]
+
+        # World-space rotation from calibration direction to current direction
+        # This IS the movement the person made — no conversion needed
         delta = calib_dir.rotation_difference(target_dir)
 
         pb.rotation_mode = "QUATERNION"
