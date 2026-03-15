@@ -40,6 +40,13 @@ class Camera:
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open camera at {path} — device may be in use by another application")
 
+        # Cap resolution to 640x480 — MediaPipe doesn't benefit from higher,
+        # and full-res (1080p/4K) causes thermal throttling from the extra
+        # pixels flowing through color conversion, inference, and preview
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize frame queue lag
+
     def read(self) -> tuple[bool, np.ndarray | None]:
         if self._cap is None:
             return False, None

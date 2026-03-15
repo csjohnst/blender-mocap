@@ -30,6 +30,8 @@ class PreviewWindow:
 
     def __init__(self):
         self._open = False
+        self._frame_count = 0
+        self._display_interval = 3  # Show every Nth frame to reduce CPU load
 
     def open(self) -> None:
         cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -40,10 +42,15 @@ class PreviewWindow:
         if not self._open:
             return False
 
-        if landmarks:
-            self._draw_skeleton(frame_bgr, landmarks)
+        self._frame_count += 1
 
-        cv2.imshow(self.WINDOW_NAME, frame_bgr)
+        # Only render preview every Nth frame — skeleton drawing and imshow
+        # are CPU-intensive and the preview is just for visual confirmation
+        if self._frame_count % self._display_interval == 0:
+            if landmarks:
+                self._draw_skeleton(frame_bgr, landmarks)
+            cv2.imshow(self.WINDOW_NAME, frame_bgr)
+
         key = cv2.waitKey(1) & 0xFF
         if key == 27:  # ESC
             return False

@@ -48,11 +48,24 @@ class PoseEstimator:
         )
         self._landmarker = PoseLandmarker.create_from_options(options)
         self._frame_timestamp_ms = 0
+        self._frame_count = 0
+        self._last_result: list[dict] | None = None
+        self._skip_interval = 2  # Run inference every Nth frame
 
     def estimate(self, frame_rgb: np.ndarray) -> list[dict] | None:
-        """Process a frame and return 33 landmarks as dicts, or None if no pose detected."""
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        """Process a frame and return 33 landmarks as dicts, or None if no pose detected.
+
+        Runs inference every skip_interval frames and reuses the last result
+        for skipped frames to reduce CPU/GPU thermal load.
+        """
+        self._frame_count += 1
         self._frame_timestamp_ms += 33  # ~30fps increment
+
+        # Reuse last result on skipped frames
+        if self._frame_count % self._skip_interval != 0 and self._last_result is not None:
+            return self._last_result
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         result = self._landmarker.detect_for_video(mp_image, self._frame_timestamp_ms)
 
         if not result.pose_landmarks or len(result.pose_landmarks) == 0:
@@ -66,6 +79,7 @@ class PoseEstimator:
                 "z": lm.z,
                 "visibility": lm.visibility,
             })
+        self._last_result = landmarks
         return landmarks
 
     def close(self) -> None:
