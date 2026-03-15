@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 
-ADDON_VERSION = "0.24.0"
+ADDON_VERSION = "0.23.0"
 VENV_DIR = os.path.expanduser("~/.blender-mocap/venv")
 RECORDINGS_DIR = os.path.expanduser("~/.blender-mocap/recordings")
 

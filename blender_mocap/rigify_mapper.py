@@ -1,24 +1,13 @@
 # blender_mocap/rigify_mapper.py
-"""Maps MediaPipe pose landmarks to Rigify armature.
+"""Maps MediaPipe pose landmarks to Rigify armature bone rotations.
 
-APPROACH:
-- LIMBS: IK mode — position hand_ik/foot_ik targets at landmark positions.
-  Blender's IK solver handles elbow/knee bending automatically.
-- SPINE/HEAD: FK calibration-delta rotation approach.
-- ROOT: hip midpoint X (lateral), lowest foot Z (vertical).
-
-IK eliminates all the FK rotation chain math that was causing
-incorrect elbow/knee/arm behavior.
+SIMPLE APPROACH:
+For each bone, compute an "absolute" rotation from rest to target using
+the bone's rest_local matrix. Store the calibration-frame absolute rotation.
+At each frame: rotation_quaternion = calib_absolute^-1 @ current_absolute.
+This gives identity at calibration and the correct delta for movement.
 """
 import math
-
-
-def mediapipe_to_blender_coords(lm: dict) -> tuple[float, float, float]:
-    bx = lm["x"] - 0.5
-    by = lm["z"]              # closer to camera = -Y
-    bz = -(lm["y"] - 0.5)    # top of image = +Z
-    return bx, by, bz
-
 
 RIGIFY_BONE_MAP = {
     "upper_arm_fk.L": {"parent_idx": 11, "child_idx": 13},
@@ -35,23 +24,6 @@ RIGIFY_BONE_MAP = {
     "foot_fk.R":      {"indices": [30, 32], "type": "foot"},
 }
 
-# IK target bones and their landmark mappings
-IK_TARGETS = {
-    "hand_ik.L": {"landmark": 15, "shoulder": 11},   # left wrist, left shoulder
-    "hand_ik.R": {"landmark": 16, "shoulder": 12},   # right wrist, right shoulder
-    "foot_ik.L": {"landmark": 27, "hip": 23},        # left ankle, left hip
-    "foot_ik.R": {"landmark": 28, "hip": 24},        # right ankle, right hip
-}
-
-# IK pole targets (elbow/knee direction)
-IK_POLES = {
-    "upper_arm_ik_target.L": 13,  # left elbow
-    "upper_arm_ik_target.R": 14,  # right elbow
-    "thigh_ik_target.L": 25,      # left knee
-    "thigh_ik_target.R": 26,      # right knee
-}
-
-# Bones to ensure are in IK mode (IK_FK = 0.0)
 IK_FK_SWITCH_BONES = [
     "upper_arm_parent.L",
     "upper_arm_parent.R",
@@ -63,146 +35,149 @@ CHEST_BONE = "chest"
 HEAD_BONE = "head"
 TORSO_BONE = "torso"
 
-FK_CHAIN_PARENT = {}  # Not used in IK approach but kept for compat
+# FK chain parent relationships: child -> parent
+# Used to subtract parent's world rotation from child's delta
+FK_CHAIN_PARENT = {
+    "forearm_fk.L": "upper_arm_fk.L",
+    "forearm_fk.R": "upper_arm_fk.R",
+    "hand_fk.L":    "forearm_fk.L",
+    "hand_fk.R":    "forearm_fk.R",
+    "shin_fk.L":    "thigh_fk.L",
+    "shin_fk.R":    "thigh_fk.R",
+    "foot_fk.L":    "shin_fk.L",
+    "foot_fk.R":    "shin_fk.R",
+}
 
 # Calibration state
-_calib_rotations = {}
+_calib_rotations = {}  # bone_name -> Quaternion (absolute rotation at calibration)
+_calib_dirs = {}       # bone_name -> Vector (direction at calibration, for chain correction)
 _calib_body_angle = 0.0
-_calib_torso_size = 0.0
-_calib_shoulder_width = 0.0
-_calib_arm_scale = 1.0     # rig_arm_length / person_arm_length
-_calib_leg_scale = 1.0     # rig_leg_length / person_leg_length
-_calib_ik_rest = {}        # IK target rest positions
+_calib_torso_size = 0.0    # Average torso metric at calibration (for depth)
+_calib_shoulder_width = 0.0  # Shoulder width at calibration (for rotation)
 _is_calibrated = False
 _latest_landmarks = None
-_prev_rotations = {}
-_smoothing_factor = 0.4
-_max_angular_velocity = math.radians(120)
-_prev_ik_positions = {}    # Smoothing for IK targets
-
-# Bone cache
-_bone_cache = {}
+_prev_rotations = {}   # bone_name -> Quaternion (previous frame, for smoothing)
+_smoothing_factor = 0.4  # 0 = no smoothing (instant), 1 = frozen. 0.4 = natural
+_max_angular_velocity = math.radians(120)  # Max degrees per frame (~30fps = 3600°/s)
 
 
-def _compute_torso_metrics(landmarks_raw):
-    ls = landmarks_raw[11]
-    rs = landmarks_raw[12]
-    lh = landmarks_raw[23]
-    rh = landmarks_raw[24]
+def _compute_torso_metrics(landmarks_raw: list[dict]) -> tuple[float, float, float]:
+    """Compute torso size and rotation from the 4 torso landmarks (raw MediaPipe coords).
+
+    Uses image-plane measurements (X, Y only — not depth Z) which are reliable.
+
+    Returns: (torso_size, shoulder_width_xy, body_rotation_rad)
+
+    torso_size: average of shoulder width, hip width, and torso height in image coords.
+                Inversely proportional to depth (closer = bigger).
+    shoulder_width_xy: apparent shoulder width in image plane.
+    body_rotation_rad: estimated body rotation from shoulder width foreshortening.
+    """
+    # Use RAW MediaPipe coords (image plane) for size — these are reliable
+    ls = landmarks_raw[11]  # left shoulder
+    rs = landmarks_raw[12]  # right shoulder
+    lh = landmarks_raw[23]  # left hip
+    rh = landmarks_raw[24]  # right hip
+
+    # Shoulder width in image plane
     shoulder_w = math.sqrt((rs["x"] - ls["x"])**2 + (rs["y"] - ls["y"])**2)
+
+    # Hip width in image plane
     hip_w = math.sqrt((rh["x"] - lh["x"])**2 + (rh["y"] - lh["y"])**2)
-    sm_x, sm_y = (ls["x"] + rs["x"]) / 2, (ls["y"] + rs["y"]) / 2
-    hm_x, hm_y = (lh["x"] + rh["x"]) / 2, (lh["y"] + rh["y"]) / 2
+
+    # Torso height: shoulder midpoint to hip midpoint
+    sm_x = (ls["x"] + rs["x"]) / 2
+    sm_y = (ls["y"] + rs["y"]) / 2
+    hm_x = (lh["x"] + rh["x"]) / 2
+    hm_y = (lh["y"] + rh["y"]) / 2
     torso_h = math.sqrt((sm_x - hm_x)**2 + (sm_y - hm_y)**2)
+
+    # Average size metric (stable — combines 3 measurements)
     torso_size = (shoulder_w + hip_w + torso_h) / 3
-    return torso_size, shoulder_w
+
+    return torso_size, shoulder_w, 0.0
+
+
+def mediapipe_to_blender_coords(lm: dict) -> tuple[float, float, float]:
+    bx = lm["x"] - 0.5
+    by = lm["z"]              # closer to camera = -Y (character faces -Y)
+    bz = -(lm["y"] - 0.5)    # top of image = +Z
+    return bx, by, bz
+
+
+def _get_target_dir(coords, mapping):
+    """Get target direction from landmark coordinates."""
+    from mathutils import Vector
+    if mapping.get("type") == "foot":
+        heel_idx, toe_idx = mapping["indices"]
+        return (coords[toe_idx] - coords[heel_idx]).normalized()
+    else:
+        return (coords[mapping["child_idx"]] - coords[mapping["parent_idx"]]).normalized()
 
 
 def _compute_absolute_rotation(rest_bone, target_dir):
+    """Compute the absolute rotation for a bone to point at target_dir.
+
+    Returns a Quaternion in the bone's own local frame.
+
+    IMPORTANT: Uses bone.matrix_local (bone-local → armature), NOT rest_local
+    (bone-local → parent-local). target_dir is in armature space, so we need
+    bone.matrix_local^-1 to convert it to bone-local. Using rest_local would
+    map the rotation to the wrong axis for child bones (e.g., elbow bend
+    becomes forearm twist).
+    """
     from mathutils import Vector
+
+    # Convert armature-space target direction into bone's own local frame
     local_target = (rest_bone.matrix_local.to_3x3().inverted() @ target_dir).normalized()
+
+    # In bone-local frame, the bone points along Y
     local_rest = Vector((0, 1, 0))
+
+    # Rotation from rest to target in the bone's local frame
     return local_rest.rotation_difference(local_target)
 
 
-def _smooth_rotation(bone_name, new_rot):
-    from mathutils import Quaternion
-    if bone_name not in _prev_rotations:
-        _prev_rotations[bone_name] = new_rot.copy()
-        return new_rot
-    prev = _prev_rotations[bone_name]
-    angle = prev.rotation_difference(new_rot).angle
-    if angle > _max_angular_velocity:
-        clamped_t = _max_angular_velocity / angle
-        new_rot = prev.slerp(new_rot, clamped_t)
-    blend = 1.0 - _smoothing_factor
-    smoothed = prev.slerp(new_rot, blend)
-    _prev_rotations[bone_name] = smoothed.copy()
-    return smoothed
-
-
-def _smooth_position(name, pos, factor=0.3):
-    """Smooth a 3D position with linear interpolation."""
-    if name not in _prev_ik_positions:
-        _prev_ik_positions[name] = pos
-        return pos
-    prev = _prev_ik_positions[name]
-    blend = 1.0 - factor
-    smoothed = (
-        prev[0] + (pos[0] - prev[0]) * blend,
-        prev[1] + (pos[1] - prev[1]) * blend,
-        prev[2] + (pos[2] - prev[2]) * blend,
-    )
-    _prev_ik_positions[name] = smoothed
-    return smoothed
-
-
-def set_smoothing(value):
-    global _smoothing_factor
-    _smoothing_factor = max(0.0, min(0.95, value))
-
-
-def calibrate(landmarks):
+def calibrate(landmarks: list[dict]) -> None:
+    """Store the current pose as calibration reference."""
     from mathutils import Vector
-    global _calib_rotations, _calib_body_angle, _is_calibrated
+    global _calib_rotations, _calib_dirs, _calib_body_angle, _is_calibrated
     global _calib_torso_size, _calib_shoulder_width
-    global _calib_arm_scale, _calib_leg_scale, _calib_ik_rest
 
     coords = [Vector(mediapipe_to_blender_coords(lm)) for lm in landmarks]
     _calib_rotations = {}
-    _calib_ik_rest = {}
+    _calib_dirs = {}
 
-    _calib_torso_size, _calib_shoulder_width = _compute_torso_metrics(landmarks)
+    # Store torso metrics for depth estimation
+    _calib_torso_size, _calib_shoulder_width, _ = _compute_torso_metrics(landmarks)
+    print(f"  torso_size: {_calib_torso_size:.4f}, shoulder_width: {_calib_shoulder_width:.4f}")
 
     print("[MoCap] === CALIBRATION ===")
-    print(f"  torso_size: {_calib_torso_size:.4f}")
 
-    # Compute arm and leg scale factors
-    # Person's arm length in our coords (shoulder to wrist)
-    person_arm_l = (coords[15] - coords[11]).length
-    person_arm_r = (coords[16] - coords[12]).length
-    person_arm = (person_arm_l + person_arm_r) / 2
+    # Calibrate limb bones
+    for bone_name in _bone_cache:
+        if bone_name not in RIGIFY_BONE_MAP:
+            continue
+        mapping = RIGIFY_BONE_MAP[bone_name]
+        rest_bone = _bone_cache[bone_name]
+        target_dir = _get_target_dir(coords, mapping)
+        if target_dir.length < 1e-6:
+            continue
+        abs_rot = _compute_absolute_rotation(rest_bone, target_dir)
+        _calib_rotations[bone_name] = abs_rot
+        _calib_dirs[bone_name] = target_dir.copy()
+        print(f"  {bone_name}: target=({target_dir.x:.3f}, {target_dir.y:.3f}, {target_dir.z:.3f})")
 
-    person_leg_l = (coords[27] - coords[23]).length
-    person_leg_r = (coords[28] - coords[24]).length
-    person_leg = (person_leg_l + person_leg_r) / 2
-
-    # Rig's arm/leg length from bone data
-    rig_arm = 0.0
-    rig_leg = 0.0
-    if "upper_arm_fk.L" in _bone_cache and "forearm_fk.L" in _bone_cache and "hand_fk.L" in _bone_cache:
-        rig_arm = (_bone_cache["upper_arm_fk.L"].vector.length +
-                   _bone_cache["forearm_fk.L"].vector.length +
-                   _bone_cache["hand_fk.L"].vector.length)
-    if "thigh_fk.L" in _bone_cache and "shin_fk.L" in _bone_cache:
-        rig_leg = (_bone_cache["thigh_fk.L"].vector.length +
-                   _bone_cache["shin_fk.L"].vector.length)
-
-    if person_arm > 1e-6 and rig_arm > 1e-6:
-        _calib_arm_scale = rig_arm / person_arm
-    if person_leg > 1e-6 and rig_leg > 1e-6:
-        _calib_leg_scale = rig_leg / person_leg
-
-    print(f"  arm_scale: {_calib_arm_scale:.2f} (rig={rig_arm:.3f} person={person_arm:.3f})")
-    print(f"  leg_scale: {_calib_leg_scale:.2f} (rig={rig_leg:.3f} person={person_leg:.3f})")
-
-    # Store IK target rest positions
-    for ik_name in IK_TARGETS:
-        if ik_name in _bone_cache:
-            bone = _bone_cache[ik_name]
-            _calib_ik_rest[ik_name] = Vector(bone.head_local)
-            print(f"  IK rest {ik_name}: ({bone.head_local.x:.3f}, {bone.head_local.y:.3f}, {bone.head_local.z:.3f})")
-
-    # Store calibration landmark positions for delta computation
-    _calib_ik_rest["_coords"] = [c.copy() for c in coords]
-
-    # Calibrate spine/head (FK)
+    # Calibrate spine
     mid_hip = (coords[23] + coords[24]) / 2
     mid_shoulder = (coords[11] + coords[12]) / 2
     spine_dir = (mid_shoulder - mid_hip).normalized()
     if CHEST_BONE in _bone_cache and spine_dir.length > 1e-6:
-        _calib_rotations[CHEST_BONE] = _compute_absolute_rotation(_bone_cache[CHEST_BONE], spine_dir)
+        abs_rot = _compute_absolute_rotation(_bone_cache[CHEST_BONE], spine_dir)
+        _calib_rotations[CHEST_BONE] = abs_rot
+        print(f"  {CHEST_BONE}: target=({spine_dir.x:.3f}, {spine_dir.y:.3f}, {spine_dir.z:.3f})")
 
+    # Calibrate head
     l_ear, r_ear, nose = coords[7], coords[8], coords[0]
     ear_mid = (l_ear + r_ear) / 2
     face_right = (r_ear - l_ear).normalized()
@@ -211,26 +186,65 @@ def calibrate(landmarks):
     if face_up.z < 0:
         face_up = -face_up
     if HEAD_BONE in _bone_cache and face_up.length > 1e-6:
-        _calib_rotations[HEAD_BONE] = _compute_absolute_rotation(_bone_cache[HEAD_BONE], face_up)
+        abs_rot = _compute_absolute_rotation(_bone_cache[HEAD_BONE], face_up)
+        _calib_rotations[HEAD_BONE] = abs_rot
+        print(f"  {HEAD_BONE}: face_up=({face_up.x:.3f}, {face_up.y:.3f}, {face_up.z:.3f})")
 
+    # Calibrate body angle (average of shoulder and hip lines)
     shoulder_vec = (coords[12] - coords[11]).normalized()
     hip_vec = (coords[24] - coords[23]).normalized()
     _calib_body_angle = (math.atan2(shoulder_vec.y, shoulder_vec.x) +
                          math.atan2(hip_vec.y, hip_vec.x)) / 2
+    print(f"  body_angle: {math.degrees(_calib_body_angle):.1f}°")
 
     _is_calibrated = True
-    print(f"[MoCap] Calibration complete")
+    print(f"[MoCap] Calibrated {len(_calib_rotations)} bones")
 
 
-def is_calibrated():
+def is_calibrated() -> bool:
     return _is_calibrated
 
 
-def clear_calibration():
-    global _is_calibrated, _prev_rotations, _prev_ik_positions
+def clear_calibration() -> None:
+    global _is_calibrated, _prev_rotations
     _is_calibrated = False
     _prev_rotations = {}
-    _prev_ik_positions = {}
+
+
+def set_smoothing(value: float) -> None:
+    """Set rotation smoothing factor. 0 = instant, 1 = frozen."""
+    global _smoothing_factor
+    _smoothing_factor = max(0.0, min(0.95, value))
+
+
+def _smooth_rotation(bone_name, new_rot):
+    """Apply temporal smoothing and angular velocity clamping to a rotation.
+
+    Returns the smoothed quaternion.
+    """
+    from mathutils import Quaternion
+
+    if bone_name not in _prev_rotations:
+        _prev_rotations[bone_name] = new_rot.copy()
+        return new_rot
+
+    prev = _prev_rotations[bone_name]
+
+    # Angular velocity clamp: if rotation changed too much in one frame,
+    # it's likely a tracking glitch — clamp to max angular velocity
+    angle = prev.rotation_difference(new_rot).angle
+    if angle > _max_angular_velocity:
+        # Limit the change to max_angular_velocity
+        clamped_t = _max_angular_velocity / angle
+        new_rot = prev.slerp(new_rot, clamped_t)
+
+    # Temporal smoothing: slerp between previous and new
+    # _smoothing_factor = how much to keep from previous frame
+    blend = 1.0 - _smoothing_factor
+    smoothed = prev.slerp(new_rot, blend)
+
+    _prev_rotations[bone_name] = smoothed.copy()
+    return smoothed
 
 
 def store_latest_landmarks(landmarks):
@@ -242,22 +256,29 @@ def get_latest_landmarks():
     return _latest_landmarks
 
 
+# Cache of bone rest data (populated on first apply)
+_bone_cache = {}  # bone_name -> rest bone
+
+
 def _ensure_bone_cache(armature):
+    """Cache bone rest data from armature."""
     global _bone_cache
     if _bone_cache:
         return
-    all_bones = (list(RIGIFY_BONE_MAP.keys()) + [CHEST_BONE, HEAD_BONE] +
-                 list(IK_TARGETS.keys()) + list(IK_POLES.keys()))
+
+    all_bones = list(RIGIFY_BONE_MAP.keys()) + [CHEST_BONE, HEAD_BONE]
     for bone_name in all_bones:
         if bone_name in armature.data.bones:
             _bone_cache[bone_name] = armature.data.bones[bone_name]
 
     print(f"[MoCap] Bone cache: {len(_bone_cache)} bones found")
-    for name in list(IK_TARGETS.keys()) + list(IK_POLES.keys()):
-        if name in _bone_cache:
-            print(f"[MoCap]   IK: {name} ✓")
+    for name in all_bones:
+        if name not in _bone_cache:
+            print(f"[MoCap] WARNING: bone '{name}' not found in armature!")
         else:
-            print(f"[MoCap]   IK: {name} ✗ (not found)")
+            bone = _bone_cache[name]
+            v = bone.vector.normalized()
+            print(f"[MoCap]   {name}: vector=({v.x:.3f}, {v.y:.3f}, {v.z:.3f}) parent={bone.parent.name if bone.parent else 'None'}")
 
 
 def clear_bone_cache():
@@ -266,36 +287,64 @@ def clear_bone_cache():
 
 
 def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
-    """Apply MediaPipe landmarks to a Rigify armature using IK for limbs."""
+    """Apply MediaPipe landmarks to a Rigify armature."""
     from mathutils import Vector, Quaternion
 
     _ensure_bone_cache(armature)
 
     coords = [Vector(mediapipe_to_blender_coords(lm)) for lm in landmarks]
 
+    # Auto-calibrate on first frame
     if not _is_calibrated:
         calibrate(landmarks)
 
-    calib_coords = _calib_ik_rest.get("_coords", coords)
+    # --- DEPTH & ROTATION from torso geometry ---
+    current_torso_size, current_shoulder_w, _ = _compute_torso_metrics(landmarks)
 
-    # --- TORSO ROTATION ---
-    current_torso_size, current_shoulder_w = _compute_torso_metrics(landmarks)
+    # Depth ratio: how much closer/farther than calibration
+    # Larger apparent size = closer = depth_ratio < 1
+    if current_torso_size > 1e-6 and _calib_torso_size > 1e-6:
+        depth_ratio = _calib_torso_size / current_torso_size
+    else:
+        depth_ratio = 1.0
 
+    # Body rotation from shoulder width foreshortening
+    # cos(θ) = (apparent_shoulder_w / calib_shoulder_w) * depth_ratio
+    # When rotated, shoulders appear narrower; depth_ratio corrects for distance changes
+    if _calib_shoulder_width > 1e-6:
+        cos_theta = min(1.0, (current_shoulder_w / _calib_shoulder_width) * depth_ratio)
+        # Determine rotation sign from shoulder depth difference
+        # In our coords, deeper shoulder has more negative Y (by = lm.z)
+        l_shoulder_depth = landmarks[11]["z"]
+        r_shoulder_depth = landmarks[12]["z"]
+        rotation_sign = 1.0 if l_shoulder_depth < r_shoulder_depth else -1.0
+        body_rotation = rotation_sign * math.acos(max(0.0, cos_theta))
+    else:
+        body_rotation = 0.0
+
+    # Also compute body rotation from shoulder/hip line in XZ plane
     shoulder_vec = (coords[12] - coords[11]).normalized()
     hip_vec = (coords[24] - coords[23]).normalized()
     avg_angle = (math.atan2(shoulder_vec.y, shoulder_vec.x) +
                  math.atan2(hip_vec.y, hip_vec.x)) / 2
-    delta_angle = avg_angle - _calib_body_angle
-    if abs(delta_angle) < math.radians(5):
-        delta_angle = 0.0
+    line_rotation = avg_angle - _calib_body_angle
 
+    # Blend: use trig rotation for large turns, line angle for small adjustments
+    if abs(body_rotation) > math.radians(10):
+        final_rotation = body_rotation
+    elif abs(line_rotation) > math.radians(5):
+        final_rotation = line_rotation
+    else:
+        final_rotation = 0.0
+
+    # --- TORSO ROTATION ---
     if TORSO_BONE in armature.pose.bones:
         pb = armature.pose.bones[TORSO_BONE]
         pb.rotation_mode = "QUATERNION"
-        raw = Quaternion(Vector((0, 0, 1)), -delta_angle)
+        raw = Quaternion(Vector((0, 0, 1)), -final_rotation)
         pb.rotation_quaternion = _smooth_rotation(TORSO_BONE, raw)
 
-    # --- CHEST (FK) ---
+    # --- CHEST ---
     if CHEST_BONE in _bone_cache and CHEST_BONE in _calib_rotations:
         pb = armature.pose.bones[CHEST_BONE]
         rest_bone = _bone_cache[CHEST_BONE]
@@ -304,11 +353,12 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
         spine_dir = (mid_shoulder - mid_hip).normalized()
         if spine_dir.length > 1e-6:
             current_abs = _compute_absolute_rotation(rest_bone, spine_dir)
-            delta = _calib_rotations[CHEST_BONE].inverted() @ current_abs
+            calib_abs = _calib_rotations[CHEST_BONE]
+            delta = calib_abs.inverted() @ current_abs
             pb.rotation_mode = "QUATERNION"
             pb.rotation_quaternion = _smooth_rotation(CHEST_BONE, delta)
 
-    # --- HEAD (FK) ---
+    # --- HEAD ---
     if HEAD_BONE in _bone_cache and HEAD_BONE in _calib_rotations:
         pb = armature.pose.bones[HEAD_BONE]
         rest_bone = _bone_cache[HEAD_BONE]
@@ -321,84 +371,102 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
             face_up = -face_up
         if face_up.length > 1e-6:
             current_abs = _compute_absolute_rotation(rest_bone, face_up)
-            delta = _calib_rotations[HEAD_BONE].inverted() @ current_abs
+            calib_abs = _calib_rotations[HEAD_BONE]
+            delta = calib_abs.inverted() @ current_abs
             pb.rotation_mode = "QUATERNION"
             pb.rotation_quaternion = _smooth_rotation(HEAD_BONE, delta)
 
-    # --- LIMBS (IK targets) ---
-    # Position IK target bones at scaled landmark positions
-    # The IK solver automatically bends elbows and knees correctly
-    for ik_name, info in IK_TARGETS.items():
-        if ik_name not in armature.pose.bones:
+    # --- LIMBS ---
+    # Process ROOT bones first (upper_arm, thigh), then CHILDREN (forearm, shin, etc.)
+    # For children, include the parent's computed rotation when converting
+    # target direction to bone-local space. This is critical for large
+    # parent rotations (e.g., T-pose bicep flex = 90° shoulder rotation).
+    computed_quats = {}  # bone_name -> Quaternion we set
+
+    # Separate into roots and children
+    root_bones = [n for n in RIGIFY_BONE_MAP if n not in FK_CHAIN_PARENT]
+    child_bones_ordered = [
+        # Process level by level: forearm/shin first, then hand/foot
+        n for n in ["forearm_fk.L", "forearm_fk.R", "shin_fk.L", "shin_fk.R",
+                    "hand_fk.L", "hand_fk.R", "foot_fk.L", "foot_fk.R"]
+        if n in FK_CHAIN_PARENT
+    ]
+
+    # ROOT BONES: use bone.matrix_local (parent is at rest)
+    for bone_name in root_bones:
+        if bone_name not in armature.pose.bones or bone_name not in _bone_cache:
             continue
-        if ik_name not in _calib_ik_rest:
+        if bone_name not in _calib_rotations:
             continue
 
-        pb = armature.pose.bones[ik_name]
-        lm_idx = info["landmark"]
+        pb = armature.pose.bones[bone_name]
+        rest_bone = _bone_cache[bone_name]
+        target_dir = _get_target_dir(coords, RIGIFY_BONE_MAP[bone_name])
+        if target_dir.length < 1e-6:
+            continue
 
-        # Current and calibration landmark positions
-        current_pos = coords[lm_idx]
+        current_abs = _compute_absolute_rotation(rest_bone, target_dir)
+        calib_abs = _calib_rotations[bone_name]
+        delta = calib_abs.inverted() @ current_abs
 
-        # Origin: shoulder for arms, hip for legs
-        if "shoulder" in info:
-            origin_idx = info["shoulder"]
-            scale = _calib_arm_scale
+        pb.rotation_mode = "QUATERNION"
+        pb.rotation_quaternion = _smooth_rotation(bone_name, delta)
+        computed_quats[bone_name] = delta
+
+    # CHILD BONES: include parent's rotation in the conversion
+    for bone_name in child_bones_ordered:
+        if bone_name not in armature.pose.bones or bone_name not in _bone_cache:
+            continue
+        if bone_name not in _calib_rotations:
+            continue
+
+        pb = armature.pose.bones[bone_name]
+        rest_bone = _bone_cache[bone_name]
+        target_dir = _get_target_dir(coords, RIGIFY_BONE_MAP[bone_name])
+        if target_dir.length < 1e-6:
+            continue
+
+        parent_name = FK_CHAIN_PARENT[bone_name]
+
+        if parent_name in computed_quats and parent_name in _bone_cache:
+            # Parent's current 3x3 = rest orientation @ our applied rotation
+            parent_q = computed_quats[parent_name]
+            parent_bone = _bone_cache[parent_name]
+            parent_current_3x3 = parent_bone.matrix_local.to_3x3() @ parent_q.to_matrix()
+
+            # rest_local: this bone's rest transform relative to parent
+            rest_local_3x3 = (parent_bone.matrix_local.inverted() @ rest_bone.matrix_local).to_3x3()
+
+            # Effective 3x3: parent's current orientation @ bone's rest_local
+            effective_3x3 = parent_current_3x3 @ rest_local_3x3
+
+            # Convert target direction including parent's rotation
+            local_target = (effective_3x3.inverted() @ target_dir).normalized()
+            current_abs = Vector((0, 1, 0)).rotation_difference(local_target)
         else:
-            origin_idx = info["hip"]
-            scale = _calib_leg_scale
+            # Fallback: treat like root bone
+            current_abs = _compute_absolute_rotation(rest_bone, target_dir)
 
-        current_origin = coords[origin_idx]
-        calib_origin = calib_coords[origin_idx]
-        calib_target = calib_coords[lm_idx]
+        calib_abs = _calib_rotations[bone_name]
+        delta = calib_abs.inverted() @ current_abs
 
-        # Delta from calibration, scaled to rig proportions
-        delta = current_pos - current_origin - (calib_target - calib_origin)
-        scaled_delta = delta * scale
+        pb.rotation_mode = "QUATERNION"
+        pb.rotation_quaternion = _smooth_rotation(bone_name, delta)
+        computed_quats[bone_name] = delta
 
-        # Apply as offset from rest position
-        rest_pos = _calib_ik_rest[ik_name]
-        new_pos = (rest_pos.x + scaled_delta.x,
-                   rest_pos.y + scaled_delta.y,
-                   rest_pos.z + scaled_delta.z)
-
-        smoothed = _smooth_position(ik_name, new_pos, _smoothing_factor * 0.8)
-        pb.location = (smoothed[0] - rest_pos.x,
-                       smoothed[1] - rest_pos.y,
-                       smoothed[2] - rest_pos.z)
-
-    # --- IK POLE TARGETS (elbow/knee direction) ---
-    for pole_name, lm_idx in IK_POLES.items():
-        if pole_name not in armature.pose.bones:
-            continue
-        if pole_name not in _bone_cache:
-            continue
-
-        pb = armature.pose.bones[pole_name]
-        pole_rest = _bone_cache[pole_name].head_local
-
-        current_pos = coords[lm_idx]
-        calib_pos = calib_coords[lm_idx]
-
-        # Determine scale (arms or legs)
-        scale = _calib_arm_scale if "arm" in pole_name else _calib_leg_scale
-
-        delta = (current_pos - calib_pos) * scale
-        new_pos = (pole_rest.x + delta.x,
-                   pole_rest.y + delta.y,
-                   pole_rest.z + delta.z)
-
-        smoothed = _smooth_position(pole_name, new_pos, _smoothing_factor * 0.5)
-        pb.location = (smoothed[0] - pole_rest.x,
-                       smoothed[1] - pole_rest.y,
-                       smoothed[2] - pole_rest.z)
-
-    # Root position: hip X (lateral), lowest foot Z (vertical)
+    # Root position:
+    # X: hip midpoint X (lateral movement from image plane — reliable)
+    # Y: computed from torso size ratio (depth — trigonometric, much more accurate than MediaPipe Z)
+    # Z: lowest foot Z (vertical/jumping)
     hip_mid = (coords[23] + coords[24]) / 2
     lowest_foot_z = min(coords[27].z, coords[28].z)
 
+    # Depth from torso size: depth_ratio > 1 means farther (more negative Y)
+    # Scale factor converts the ratio to Blender units
+    computed_depth_y = -(depth_ratio - 1.0)  # 0 at calibration, negative when farther
+
     return {
-        "_root_xy": (hip_mid.x, 0.0),  # No depth — too noisy from single camera
+        "_root_xy": (hip_mid.x, computed_depth_y),
         "_root_z": lowest_foot_z,
     }
 
