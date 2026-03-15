@@ -168,14 +168,14 @@ def calibrate(landmarks: list[dict]) -> None:
         _calib_dirs[bone_name] = target_dir.copy()
         print(f"  {bone_name}: target=({target_dir.x:.3f}, {target_dir.y:.3f}, {target_dir.z:.3f})")
 
-    # Calibrate spine
-    mid_hip = (coords[23] + coords[24]) / 2
-    mid_shoulder = (coords[11] + coords[12]) / 2
-    spine_dir = (mid_shoulder - mid_hip).normalized()
-    if CHEST_BONE in _bone_cache and spine_dir.length > 1e-6:
-        abs_rot = _compute_absolute_rotation(_bone_cache[CHEST_BONE], spine_dir)
-        _calib_rotations[CHEST_BONE] = abs_rot
-        print(f"  {CHEST_BONE}: target=({spine_dir.x:.3f}, {spine_dir.y:.3f}, {spine_dir.z:.3f})")
+    # Calibrate spine (store torso height for lean detection)
+    sm_y = (landmarks[11]["y"] + landmarks[12]["y"]) / 2
+    hm_y = (landmarks[23]["y"] + landmarks[24]["y"]) / 2
+    calibrate._calib_torso_h = abs(hm_y - sm_y)
+    sm_x = (landmarks[11]["x"] + landmarks[12]["x"]) / 2
+    hm_x = (landmarks[23]["x"] + landmarks[24]["x"]) / 2
+    calibrate._calib_lateral = sm_x - hm_x
+    print(f"  chest: torso_h={calibrate._calib_torso_h:.4f} lateral={calibrate._calib_lateral:.4f}")
 
     # Calibrate head
     l_ear, r_ear, nose = coords[7], coords[8], coords[0]
@@ -344,19 +344,53 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
         raw = Quaternion(Vector((0, 0, 1)), -final_rotation)
         pb.rotation_quaternion = _smooth_rotation(TORSO_BONE, raw)
 
-    # --- CHEST ---
-    if CHEST_BONE in _bone_cache and CHEST_BONE in _calib_rotations:
+    # --- CHEST (spine lean) ---
+    # Forward lean computed from IMAGE PLANE torso height (reliable)
+    # When leaning forward, torso appears shorter due to foreshortening
+    # cos(lean_angle) = current_torso_height / calib_torso_height
+    if CHEST_BONE in armature.pose.bones:
         pb = armature.pose.bones[CHEST_BONE]
-        rest_bone = _bone_cache[CHEST_BONE]
-        mid_hip = (coords[23] + coords[24]) / 2
-        mid_shoulder = (coords[11] + coords[12]) / 2
-        spine_dir = (mid_shoulder - mid_hip).normalized()
-        if spine_dir.length > 1e-6:
-            current_abs = _compute_absolute_rotation(rest_bone, spine_dir)
-            calib_abs = _calib_rotations[CHEST_BONE]
-            delta = calib_abs.inverted() @ current_abs
-            pb.rotation_mode = "QUATERNION"
-            pb.rotation_quaternion = _smooth_rotation(CHEST_BONE, delta)
+
+        # Torso height in image plane (raw MediaPipe Y coords)
+        sm_y = (landmarks[11]["y"] + landmarks[12]["y"]) / 2
+        hm_y = (landmarks[23]["y"] + landmarks[24]["y"]) / 2
+        current_torso_h = abs(hm_y - sm_y)
+
+        # Lateral tilt: shoulder midpoint X offset from hip midpoint X
+        sm_x = (landmarks[11]["x"] + landmarks[12]["x"]) / 2
+        hm_x = (landmarks[23]["x"] + landmarks[24]["x"]) / 2
+        lateral_offset = sm_x - hm_x  # positive = leaning right
+
+        # Store calibration torso height on first calibration
+        if not hasattr(calibrate, '_calib_torso_h'):
+            calibrate._calib_torso_h = current_torso_h
+            calibrate._calib_lateral = sm_x - hm_x
+
+        calib_h = getattr(calibrate, '_calib_torso_h', current_torso_h)
+        calib_lat = getattr(calibrate, '_calib_lateral', 0.0)
+
+        # Forward lean angle from foreshortening
+        if calib_h > 1e-6:
+            cos_lean = min(1.0, current_torso_h / calib_h)
+            lean_angle = math.acos(cos_lean)
+            # Determine lean direction from shoulder Z vs hip Z (depth)
+            shoulder_depth = (landmarks[11]["z"] + landmarks[12]["z"]) / 2
+            hip_depth = (landmarks[23]["z"] + landmarks[24]["z"]) / 2
+            if shoulder_depth < hip_depth:  # shoulders closer to camera = leaning forward
+                lean_angle = -lean_angle
+        else:
+            lean_angle = 0.0
+
+        # Lateral tilt delta
+        lateral_delta = lateral_offset - calib_lat
+
+        # Apply as X rotation (forward/back lean) and Y rotation (side tilt)
+        lean_quat = Quaternion(Vector((1, 0, 0)), lean_angle)
+        tilt_quat = Quaternion(Vector((0, 1, 0)), lateral_delta * 3.0)  # scale for visibility
+        chest_rot = lean_quat @ tilt_quat
+
+        pb.rotation_mode = "QUATERNION"
+        pb.rotation_quaternion = _smooth_rotation(CHEST_BONE, chest_rot)
 
     # --- HEAD ---
     if HEAD_BONE in _bone_cache and HEAD_BONE in _calib_rotations:
@@ -455,18 +489,15 @@ def apply_pose_to_armature(landmarks: list[dict], armature) -> dict:
         computed_quats[bone_name] = delta
 
     # Root position:
-    # X: hip midpoint X (lateral movement from image plane — reliable)
-    # Y: computed from torso size ratio (depth — trigonometric, much more accurate than MediaPipe Z)
-    # Z: lowest foot Z (vertical/jumping)
-    hip_mid = (coords[23] + coords[24]) / 2
+    # X: hip midpoint X from image plane (lateral movement — reliable)
+    # Y: depth from torso size ratio (trigonometric)
+    # Z: lowest foot from image plane (vertical/jumping)
+    hip_mid_x = (landmarks[23]["x"] + landmarks[24]["x"]) / 2 - 0.5  # centered
     lowest_foot_z = min(coords[27].z, coords[28].z)
-
-    # Depth from torso size: depth_ratio > 1 means farther (more negative Y)
-    # Scale factor converts the ratio to Blender units
-    computed_depth_y = -(depth_ratio - 1.0)  # 0 at calibration, negative when farther
+    computed_depth_y = -(depth_ratio - 1.0) if depth_ratio != 1.0 else 0.0
 
     return {
-        "_root_xy": (hip_mid.x, computed_depth_y),
+        "_root_xy": (hip_mid_x, computed_depth_y),
         "_root_z": lowest_foot_z,
     }
 
